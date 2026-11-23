@@ -13,6 +13,6 @@ One or two sentences on what should be true when this is done.
 
 ## Constraints
 
-- Files this should stay inside
-- Libraries to use
-- Guidelines to follow
+- Files this should stay inside (e.g., `backend/...`, `bot/...`, `miniapp/...`)
+- Libraries to use (do not add new dependencies to `pyproject.toml` / `package.json` without asking)
+- Guidelines to follow (`@AGENTS.md`, `_docs/plan.md`, `_docs/testing-guidelines.md`, `_docs/design-system.md`)

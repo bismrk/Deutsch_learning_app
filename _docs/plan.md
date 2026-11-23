@@ -132,7 +132,7 @@
 ```text
 Deutsch_bot/
 ├── @AGENTS.md          # Команди, правила розробки та карта документації
-├── _docs/              # Специфікація (plan.md), процес (process.md), індекс задач (tasks.md), гайди (testing-guidelines.md, design-system.md)
+├── _docs/              # plan.md, process.md, tasks.md, task-template.md, testing-guidelines.md, design-system.md, team/ (pm.md, software-engineer.md, qa-engineer.md)
 ├── backend/            # FastAPI + SQLAlchemy + FSRS + LLM + Scheduler (uv)
 │   ├── pyproject.toml
 │   ├── uv.lock
