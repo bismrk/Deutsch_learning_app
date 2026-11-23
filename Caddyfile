@@ -1,0 +1,11 @@
+{$CADDY_SITE_ADDRESS::80} {
+	handle /api/* {
+		reverse_proxy backend:8000
+	}
+
+	handle {
+		root * /srv/miniapp
+		try_files {path} /index.html
+		file_server
+	}
+}
