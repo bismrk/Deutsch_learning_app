@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     log_level: LogLevel = "INFO"
 
     database_url: str | None = None
+    db_healthcheck_timeout: float = Field(default=2.0, gt=0.0, le=3.0)
     bot_token: str | None = None
     internal_api_key: str | None = None
 
