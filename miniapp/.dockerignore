@@ -1,0 +1,17 @@
+# Local dependencies & build artifacts (built cleanly inside Docker)
+node_modules/
+dist/
+
+# Environment & secrets
+.env
+.env.*
+
+# Test & coverage outputs
+coverage/
+.vitest/
+*.log
+
+# OS & VCS
+.git/
+.DS_Store
+Thumbs.db

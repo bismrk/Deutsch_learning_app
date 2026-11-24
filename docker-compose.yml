@@ -34,6 +34,12 @@ services:
       APP_ENV:
       LOG_LEVEL:
       DATABASE_URL:
+      BOT_TOKEN:
+      INTERNAL_API_KEY:
+      LLM_BASE_URL:
+      LLM_API_KEY:
+      LLM_MODEL:
+      DAILY_LLM_LIMIT:
     depends_on:
       postgres:
         condition: service_healthy
@@ -47,8 +53,8 @@ services:
         ]
       interval: 5s
       timeout: 4s
-      retries: 6
-      start_period: 5s
+      retries: 10
+      start_period: 10s
 
   scheduler:
     build:
@@ -66,6 +72,8 @@ services:
       BOT_TOKEN:
     depends_on:
       postgres:
+        condition: service_healthy
+      backend:
         condition: service_healthy
 
   bot:
@@ -88,7 +96,9 @@ services:
         condition: service_healthy
 
   caddy:
-    image: caddy:2-alpine
+    build:
+      context: ./miniapp
+      dockerfile: Dockerfile
     restart: unless-stopped
     ports:
       - "80:80"

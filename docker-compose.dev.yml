@@ -12,23 +12,26 @@ services:
       APP_ENV: ${APP_ENV:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://postgres:postgres@postgres:5432/deutsch_learning}
+      BOT_TOKEN: ${BOT_TOKEN:-dev-bot-token-placeholder}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-dev-internal-api-key}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-chat}
+      DAILY_LLM_LIMIT: ${DAILY_LLM_LIMIT:-50}
     volumes:
       - ./backend/app:/app/app
+      - ./backend/alembic:/app/alembic
     command:
-      - uvicorn
-      - app.main:app
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8000"
-      - --reload
+      - sh
+      - -c
+      - alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
   scheduler:
     environment:
       APP_ENV: ${APP_ENV:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://postgres:postgres@postgres:5432/deutsch_learning}
-      BOT_TOKEN: ${BOT_TOKEN:-}
+      BOT_TOKEN: ${BOT_TOKEN:-dev-bot-token-placeholder}
     volumes:
       - ./backend/app:/app/app
 
@@ -37,7 +40,7 @@ services:
       APP_ENV: ${APP_ENV:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       BOT_TOKEN: ${BOT_TOKEN:-}
-      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-dev-internal-api-key}
       BACKEND_API_URL: ${BACKEND_API_URL:-http://backend:8000}
       MINIAPP_URL: ${MINIAPP_URL:-}
     volumes:
