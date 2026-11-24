@@ -23,6 +23,15 @@ services:
       - "8000"
       - --reload
 
+  scheduler:
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://postgres:postgres@postgres:5432/deutsch_learning}
+      BOT_TOKEN: ${BOT_TOKEN:-}
+    volumes:
+      - ./backend/app:/app/app
+
   caddy:
     ports: !override
       - "127.0.0.1:${CADDY_HTTP_PORT:-8080}:80"

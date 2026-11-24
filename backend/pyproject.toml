@@ -5,6 +5,7 @@ description = "FastAPI backend for the Deutsch Learning Telegram Bot and Mini Ap
 requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.14.0",
+    "apscheduler>=3.10.4,<4.0.0",
     "asyncpg>=0.30.0",
     "fastapi>=0.115.0",
     "fsrs>=6.3.3",

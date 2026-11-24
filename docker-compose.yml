@@ -50,6 +50,24 @@ services:
       retries: 6
       start_period: 5s
 
+  scheduler:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.scheduler.main"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      APP_ENV:
+      LOG_LEVEL:
+      DATABASE_URL:
+      BOT_TOKEN:
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
