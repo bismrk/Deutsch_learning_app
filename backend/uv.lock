@@ -144,6 +144,7 @@ dependencies = [
     { name = "alembic" },
     { name = "asyncpg" },
     { name = "fastapi" },
+    { name = "fsrs" },
     { name = "httpx" },
     { name = "pydantic-settings" },
     { name = "python-multipart" },
@@ -165,6 +166,7 @@ requires-dist = [
     { name = "alembic", specifier = ">=1.14.0" },
     { name = "asyncpg", specifier = ">=0.30.0" },
     { name = "fastapi", specifier = ">=0.115.0" },
+    { name = "fsrs", specifier = ">=6.3.3" },
     { name = "httpx", specifier = ">=0.28.0" },
     { name = "pydantic-settings", specifier = ">=2.6.0" },
     { name = "python-multipart", specifier = ">=0.0.20" },
@@ -197,6 +199,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/27/f9/e7820ef181026fea100bde02d811445bf8e883362d7092b6928767147056/fastapi-0.165.0.tar.gz", hash = "sha256:dd94d4128319c1e1d50535ab023ab698f850a4d2822f0e181747b46f4ff3c0ab", size = 557984, upload-time = "2026-11-18T19:15:37.076Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c4/c1/3b74c030262a1b38b1fee180f80b4007bbc11c9ac12028cb18c7bcecaec9/fastapi-0.165.0-py3-none-any.whl", hash = "sha256:896f48462042bb4f162147eb8fac7e858753dc1f486765709baf105d70e4fc5b", size = 159475, upload-time = "2026-11-18T19:15:35.345Z" },
+]
+
+[[package]]
+name = "fsrs"
+version = "6.3.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/4e/4d/a18d9850b883977ec445a69464aa0bb852910c98c42e2adabc8e0519ba00/fsrs-6.3.3.tar.gz", hash = "sha256:916ef5c7de96508c9077e1888b9786ef33babb3f59ac3108926cebfcaadccff6", size = 33686, upload-time = "2026-11-13T02:50:57.891Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/54/a9/a3a2a3c423ee08ced77906a2456631a50d10054c27f83fdf415c02198f93/fsrs-6.3.3-py3-none-any.whl", hash = "sha256:0e06323c564fdb429bf65f8d0d3d5ace05b19e005ac080f015dc8631ad3901e2", size = 22926, upload-time = "2026-11-13T02:50:56.901Z" },
 ]
 
 [[package]]
