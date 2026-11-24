@@ -981,3 +981,142 @@ async def test_sync_sheets_explicit_url_overrides_saved_without_mutating_profile
         json={"sheets_url": "   "},
     )
     assert empty_override_resp.status_code == 400
+
+
+async def test_import_form_text_allows_1_2_mib_rejects_over_2_mib_with_413_and_malformed_multipart(
+    words_client: AsyncClient,
+) -> None:
+    headers = build_bot_headers(USER_A_ID)
+
+    # Build a ~1.2 MiB UTF-8 payload with Cyrillic (expands > 2 MiB when URL-encoded)
+    sample_line = "der Zug - потяг\n"
+    sample_line_bytes = len(sample_line.encode("utf-8"))
+    repeat_1_2_mib = (1_250_000 // sample_line_bytes) + 1
+    text_1_2_mib = "E-Mail - електронна пошта\n" + (sample_line * repeat_1_2_mib)
+    assert 1_200_000 < len(text_1_2_mib.encode("utf-8")) < MAX_IMPORT_BYTES
+
+    # 1a. 1.2 MiB multipart/form-data text field succeeds (previously failed at Starlette 1 MiB cap)
+    mp_ok = await words_client.post(
+        "/api/words/import",
+        headers=headers,
+        files={"text": (None, text_1_2_mib)},
+    )
+    assert mp_ok.status_code == 200
+    assert mp_ok.json() == {"imported": 2, "duplicates": repeat_1_2_mib - 1, "skipped": 0}
+
+    # 1b. 1.2 MiB application/x-www-form-urlencoded Cyrillic text succeeds despite 3x URL expansion
+    text_1_2_mib_2 = "U-Bahn - метро\n" + (sample_line * repeat_1_2_mib)
+    form_ok = await words_client.post(
+        "/api/words/import",
+        headers=headers,
+        data={"text": text_1_2_mib_2},
+    )
+    assert form_ok.status_code == 200
+    assert form_ok.json() == {"imported": 1, "duplicates": repeat_1_2_mib, "skipped": 0}
+
+    # 2a. 2.1 MiB multipart/form-data text field -> 413 with Ukrainian error message
+    repeat_2_1_mib = (2_200_000 // sample_line_bytes) + 1
+    text_2_1_mib = "das Auto - авто\n" + (sample_line * repeat_2_1_mib)
+    assert len(text_2_1_mib.encode("utf-8")) > MAX_IMPORT_BYTES
+
+    mp_too_big = await words_client.post(
+        "/api/words/import",
+        headers=headers,
+        files={"text": (None, text_2_1_mib)},
+    )
+    assert mp_too_big.status_code == 413
+    assert "2 МБ" in mp_too_big.json()["detail"]
+    assert "Part exceeded" not in mp_too_big.text
+
+    # 2b. 2.1 MiB application/x-www-form-urlencoded (Cyrillic AND ASCII) -> 413 Ukrainian
+    form_too_big_cyr = await words_client.post(
+        "/api/words/import",
+        headers=headers,
+        data={"text": text_2_1_mib},
+    )
+    assert form_too_big_cyr.status_code == 413
+    assert "2 МБ" in form_too_big_cyr.json()["detail"]
+    assert "Field exceeded" not in form_too_big_cyr.text
+
+    ascii_line = "der Apfel - apple\n"
+    text_2_1_mib_ascii = ascii_line * ((2_200_000 // len(ascii_line)) + 1)
+    assert len(text_2_1_mib_ascii.encode("utf-8")) > MAX_IMPORT_BYTES
+    form_too_big_ascii = await words_client.post(
+        "/api/words/import",
+        headers=headers,
+        data={"text": text_2_1_mib_ascii},
+    )
+    assert form_too_big_ascii.status_code == 413
+    assert "2 МБ" in form_too_big_ascii.json()["detail"]
+
+    # 3. Malformed multipart boundary & missing boundary -> 400 with Ukrainian error message
+    bad_boundary = await words_client.post(
+        "/api/words/import",
+        headers={**headers, "Content-Type": "multipart/form-data; boundary=broken"},
+        content=b"--not-the-boundary\r\nContent-Disposition: form-data; name=\"text\"\r\n\r\nhi",
+    )
+    assert bad_boundary.status_code == 400
+    assert "multipart" in bad_boundary.json()["detail"].lower()
+    assert "Invalid multipart data" not in bad_boundary.text
+
+    missing_boundary = await words_client.post(
+        "/api/words/import",
+        headers={**headers, "Content-Type": "multipart/form-data"},
+        content=b"garbage",
+    )
+    assert missing_boundary.status_code == 400
+    assert "Missing boundary" not in missing_boundary.text
+
+    # Verify rejected oversized/malformed requests imported zero new words ("das Auto"/"der Apfel")
+    final_words = (await words_client.get("/api/words", headers=headers)).json()
+    assert final_words["total"] == 3
+    assert {item["word_de"] for item in final_words["items"]} == {"E-Mail", "der Zug", "U-Bahn"}
+
+
+@pytest.mark.parametrize(
+    "out_of_range_id",
+    [0, -1, -2_147_483_649, 2_147_483_647, 2_147_483_648, 99_999_999_999_999],
+)
+async def test_delete_word_out_of_int32_range_and_non_positive_returns_404_not_500(
+    words_client: AsyncClient,
+    out_of_range_id: int,
+) -> None:
+    headers = build_tma_headers(USER_A_ID)
+    await words_client.post(
+        "/api/words/import",
+        headers=headers,
+        json={"text": "der Zug - потяг"},
+    )
+
+    resp = await words_client.delete(f"/api/words/{out_of_range_id}", headers=headers)
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "Слово не знайдено."
+
+    # Existing word remains untouched
+    words_after = (await words_client.get("/api/words", headers=headers)).json()
+    assert words_after["total"] == 1
+
+
+@pytest.mark.parametrize("bad_offset", [-1, 2_147_483_648, 99_999_999_999_999_999_999])
+async def test_get_words_rejects_out_of_range_pagination_offset_with_422_not_500(
+    words_client: AsyncClient,
+    bad_offset: int,
+) -> None:
+    headers = build_bot_headers(USER_A_ID)
+    await words_client.post(
+        "/api/words/import",
+        headers=headers,
+        json={"text": "der Zug - потяг"},
+    )
+
+    resp = await words_client.get("/api/words", headers=headers, params={"offset": bad_offset})
+    assert resp.status_code == 422
+
+    # Max valid int32 offset succeeds cleanly with empty page and accurate total
+    max_ok = await words_client.get(
+        "/api/words",
+        headers=headers,
+        params={"offset": 2_147_483_647},
+    )
+    assert max_ok.status_code == 200
+    assert max_ok.json() == {"items": [], "total": 1}

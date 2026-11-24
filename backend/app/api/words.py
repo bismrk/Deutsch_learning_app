@@ -13,6 +13,7 @@ from sqlalchemy import func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.datastructures import UploadFile as StarletteUploadFile
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.formparsers import MultiPartException
 
 from app.api.deps import get_current_user_id, get_utc_now
@@ -49,6 +50,7 @@ router = APIRouter(prefix="/words", tags=["words"])
 _ALLOWED_UPLOAD_EXTENSIONS = frozenset({".txt", ".csv"})
 _UPLOAD_CHUNK_SIZE = 64 * 1024  # 64 KiB
 _INSERT_BATCH_SIZE = 1000
+_PG_INT32_MAX = 2_147_483_647
 _WORDS_CONFLICT_INDEX_ELEMENTS = [Word.deck_id, text("lower(TRIM(BOTH FROM word_de))")]
 
 
@@ -196,15 +198,30 @@ async def _persist_parsed_words(
     )
 
 
+async def _read_request_body_bounded(
+    request: Request,
+    *,
+    max_bytes: int = MAX_IMPORT_BYTES,
+) -> bytes:
+    buffer = bytearray()
+    total = 0
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > max_bytes:
+            raise PayloadTooLargeError("Запит завеликий: максимальний розмір становить 2 МБ.")
+        buffer.extend(chunk)
+    return bytes(buffer)
+
+
 async def _extract_import_source(
     request: Request,
 ) -> tuple[str, ParseFormatHint, Literal["text", "file"]]:
     content_type = (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
 
     if content_type == "application/json":
-        raw_body = await request.body()
-        if len(raw_body) > MAX_IMPORT_BYTES:
-            raise PayloadTooLargeError("Запит завеликий: максимальний розмір становить 2 МБ.")
+        raw_body = await _read_request_body_bounded(request, max_bytes=MAX_IMPORT_BYTES)
         if not raw_body.strip():
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -234,16 +251,34 @@ async def _extract_import_source(
         return parsed_json.text, "text", "text"
 
     if content_type in {"multipart/form-data", "application/x-www-form-urlencoded"}:
+        # URL-encoded UTF-8 expands up to 3x (%XX per byte); multipart text parts are raw UTF-8.
+        form_max_part_size = (
+            MAX_IMPORT_BYTES * 3
+            if content_type == "application/x-www-form-urlencoded"
+            else MAX_IMPORT_BYTES
+        )
         try:
-            form = await request.form()
-        except MultiPartException as exc:
+            form = await request.form(max_part_size=form_max_part_size)
+        except (MultiPartException, StarletteHTTPException) as exc:
+            detail_text = (
+                exc.message if isinstance(exc, MultiPartException) else str(exc.detail)
+            ).lower()
+            if "exceeded maximum size" in detail_text:
+                raise PayloadTooLargeError(
+                    "Текст завеликий: максимальний розмір становить 2 МБ.",
+                ) from exc
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Некоректний формат multipart-запиту.",
             ) from exc
 
         raw_file = form.get("file")
         raw_text = form.get("text")
+
+        if isinstance(raw_text, str) and len(raw_text.encode("utf-8")) > MAX_IMPORT_BYTES:
+            if isinstance(raw_file, StarletteUploadFile):
+                await raw_file.close()
+            raise PayloadTooLargeError("Текст завеликий: максимальний розмір становить 2 МБ.")
 
         upload = raw_file if isinstance(raw_file, StarletteUploadFile) else None
         text_value = raw_text if isinstance(raw_text, str) and raw_text.strip() else None
@@ -278,10 +313,6 @@ async def _extract_import_source(
             return decoded_text, format_hint, "file"
 
         if text_value is not None:
-            if len(text_value.encode("utf-8")) > MAX_IMPORT_BYTES:
-                raise PayloadTooLargeError(
-                    "Текст завеликий: максимальний розмір становить 2 МБ.",
-                )
             return text_value, "text", "text"
 
         raise HTTPException(
@@ -301,7 +332,7 @@ async def list_words(
     db: Annotated[AsyncSession, Depends(get_db)],
     search: Annotated[str | None, Query(max_length=200)] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    offset: Annotated[int, Query(ge=0, le=_PG_INT32_MAX)] = 0,
 ) -> WordListResponse:
     """List words in the current user's personal deck with FSRS card state, search & pagination."""
     _, changed = await ensure_user_initialized(db, user_id)
@@ -471,6 +502,12 @@ async def delete_word(
     _, changed = await ensure_user_initialized(db, user_id)
     if changed:
         await db.commit()
+
+    if word_id < 1 or word_id > _PG_INT32_MAX:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Слово не знайдено.",
+        )
 
     stmt = (
         select(Word)
