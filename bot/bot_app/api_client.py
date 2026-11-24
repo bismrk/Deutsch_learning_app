@@ -492,7 +492,7 @@ class BackendAPIClient:
         *,
         content_type: str = "text/plain",
     ) -> WordImportResult:
-        """Import vocabulary words from a ``.txt``/``.csv`` file via ``POST /api/words/import``."""
+        """Import vocabulary words from a ``.txt``/``.csv``/``.xlsx`` file via ``/words/import``."""
         return await self._request(
             "POST",
             "/api/words/import",

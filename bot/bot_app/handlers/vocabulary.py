@@ -1,4 +1,4 @@
-"""Vocabulary import FSM flow: plain text, .txt/.csv files, and Google Sheets sync."""
+"""Vocabulary import FSM flow: plain text, .txt/.csv/.xlsx files, and Google Sheets sync."""
 
 from __future__ import annotations
 
@@ -42,22 +42,32 @@ from bot_app.schemas import WordImportResult
 router = Router(name="vocabulary")
 
 MAX_IMPORT_FILE_BYTES: Final = 2 * 1024 * 1024  # 2 MiB
-ALLOWED_IMPORT_EXTENSIONS: Final[frozenset[str]] = frozenset({".txt", ".csv"})
+ALLOWED_IMPORT_EXTENSIONS: Final[frozenset[str]] = frozenset({".txt", ".csv", ".xlsx"})
+XLSX_CONTENT_TYPE: Final = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
+_IMPORT_CONTENT_TYPES: Final[dict[str, str]] = {
+    ".txt": "text/plain",
+    ".csv": "text/csv",
+    ".xlsx": XLSX_CONTENT_TYPE,
+}
 
 VOCAB_MENU_TEXT_UA: Final = (
     "📚 <b>Словник</b>\n\n"
     "Тут ти можеш поповнити свій особистий словник для тренувань:\n"
     "• надіслати слова повідомленням (наприклад, <code>der Zug - потяг</code>);\n"
-    "• завантажити файл <code>.txt</code> або <code>.csv</code> (до 2 МБ);\n"
+    "• завантажити файл <code>.txt</code>, <code>.csv</code> або <code>.xlsx</code> (до 2 МБ);\n"
     "• підключити публічну таблицю Google Sheets і синхронізувати її в один дотик."
 )
 VOCAB_IMPORT_PROMPT_UA: Final = (
     "✍️ <b>Додавання слів</b>\n\n"
     "Надішли список слів повідомленням (кожна пара з нового рядка) "
-    "або прикріпи файл <code>.txt</code> чи <code>.csv</code> до 2 МБ.\n\n"
+    "або прикріпи файл <code>.txt</code>, <code>.csv</code> чи <code>.xlsx</code> до 2 МБ.\n\n"
     "<b>Приклади формату:</b>\n"
     "<code>der Zug - потяг</code>\n"
-    "<code>die Verspätung; затримка</code>"
+    "<code>die Verspätung; затримка</code>\n"
+    "Для <code>.xlsx</code> — два або три стовпці: німецьке слово, переклад "
+    "і (за бажанням) частина мови."
 )
 VOCAB_FORMAT_HINT_UA: Final = (
     "⚠️ Не вдалося розпізнати жодного слова. Перевір формат рядків і спробуй ще раз:\n"
@@ -70,11 +80,16 @@ VOCAB_SHEETS_FORMAT_HINT_UA: Final = (
 )
 VOCAB_EMPTY_TEXT_UA: Final = (
     "Повідомлення порожнє. Надішли слова у форматі <code>der Zug - потяг</code> "
-    "або прикріпи файл <code>.txt</code> / <code>.csv</code>."
+    "або прикріпи файл <code>.txt</code>, <code>.csv</code> чи <code>.xlsx</code>."
+)
+VOCAB_LEGACY_XLS_UA: Final = (
+    "⚠️ Застарілий формат Excel (<code>.xls</code>) не підтримується.\n\n"
+    "Збережи таблицю як <code>.xlsx</code>, <code>.csv</code> або <code>.txt</code> "
+    "і надішли файл ще раз або натисни «Скасувати»."
 )
 VOCAB_UNSUPPORTED_EXTENSION_UA: Final = (
-    "⚠️ Непідтримуваний формат файлу. Підтримуються лише файли <code>.txt</code> та "
-    "<code>.csv</code>.\n\nНадішли коректний файл або натисни «Скасувати»."
+    "⚠️ Непідтримуваний формат файлу. Підтримуються лише файли <code>.txt</code>, "
+    "<code>.csv</code> та <code>.xlsx</code>.\n\nНадішли коректний файл або натисни «Скасувати»."
 )
 VOCAB_FILE_TOO_LARGE_UA: Final = (
     "⚠️ Файл завеликий: максимальний розмір становить 2 МБ.\n\n"
@@ -88,12 +103,13 @@ VOCAB_FILE_DOWNLOAD_ERROR_UA: Final = (
     "Спробуй надіслати його ще раз або натисни «Скасувати»."
 )
 VOCAB_FILE_PARSE_ERROR_UA: Final = (
-    "⚠️ Не вдалося обробити файл. Переконайся, що файл збережено в кодуванні UTF-8 "
-    "та рядки мають формат <code>der Zug - потяг</code> або <code>der Zug; потяг</code>."
+    "⚠️ Не вдалося обробити файл. Для <code>.txt</code> і <code>.csv</code> переконайся, "
+    "що файл збережено в кодуванні UTF-8 (<code>der Zug - потяг</code> або "
+    "<code>der Zug; потяг</code>), а для <code>.xlsx</code> — що файл Excel не пошкоджений."
 )
 VOCAB_UNSUPPORTED_CONTENT_UA: Final = (
     "Будь ласка, надішли слова текстом (наприклад, <code>der Zug - потяг</code>) "
-    "або прикріпи файл <code>.txt</code> / <code>.csv</code>."
+    "або прикріпи файл <code>.txt</code>, <code>.csv</code> чи <code>.xlsx</code>."
 )
 VOCAB_SHEETS_BIND_PROMPT_UA: Final = (
     "🔗 <b>Прив'язка Google Sheets</b>\n\n"
@@ -224,7 +240,7 @@ async def handle_vocabulary_menu(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == VOCAB_IMPORT_CALLBACK)
 async def handle_vocab_start_import(callback: CallbackQuery, state: FSMContext) -> None:
-    """Enter ``VocabStates.waiting_import`` to receive text lines or a ``.txt``/``.csv`` file."""
+    """Enter ``VocabStates.waiting_import`` to receive text or a ``.txt``/``.csv``/``.xlsx``."""
     await callback.answer()
     if callback.from_user is None:
         return
@@ -451,13 +467,21 @@ async def handle_vocab_import_document(
     settings: BotSettings,
     bot: Bot | None = None,
 ) -> None:
-    """Validate `.txt`/`.csv` extension and <= 2 MiB size before downloading, then import."""
+    """Validate `.txt`/`.csv`/`.xlsx` extension and <= 2 MiB size before download, then import."""
     if message.from_user is None or message.document is None:
         return
 
     document = message.document
     filename = (document.file_name or "").strip()
     suffix = Path(filename).suffix.lower()
+
+    if suffix == ".xls":
+        await message.answer(
+            VOCAB_LEGACY_XLS_UA,
+            parse_mode="HTML",
+            reply_markup=build_vocab_cancel_keyboard(),
+        )
+        return
 
     if suffix not in ALLOWED_IMPORT_EXTENSIONS:
         await message.answer(
@@ -505,7 +529,7 @@ async def handle_vocab_import_document(
         )
         return
 
-    content_type = "text/csv" if suffix == ".csv" else "text/plain"
+    content_type = _IMPORT_CONTENT_TYPES.get(suffix, "text/plain")
     try:
         result = await api_client.import_words_file(
             message.from_user.id,
@@ -672,6 +696,7 @@ __all__ = [
     "VOCAB_FILE_TOO_LARGE_UA",
     "VOCAB_FORMAT_HINT_UA",
     "VOCAB_IMPORT_PROMPT_UA",
+    "VOCAB_LEGACY_XLS_UA",
     "VOCAB_MENU_TEXT_UA",
     "VOCAB_SHEETS_ACCESS_ERROR_UA",
     "VOCAB_SHEETS_BIND_PROMPT_UA",
@@ -686,6 +711,7 @@ __all__ = [
     "VOCAB_SHEETS_UPSTREAM_ERROR_UA",
     "VOCAB_UNSUPPORTED_CONTENT_UA",
     "VOCAB_UNSUPPORTED_EXTENSION_UA",
+    "XLSX_CONTENT_TYPE",
     "VocabStates",
     "format_import_summary",
     "handle_vocab_cancel",

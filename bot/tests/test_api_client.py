@@ -485,3 +485,58 @@ async def test_handles_invalid_json_schema_as_api_unavailable() -> None:
     async with BackendAPIClient(base_url=BASE_URL, internal_api_key=SECRET_API_KEY) as client:
         with pytest.raises(APIUnavailableError):
             await client.get_me(USER_ID)
+
+
+@respx.mock
+async def test_import_words_file_sends_xlsx_filename_mime_and_maps_errors() -> None:
+    xlsx_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    xlsx_bytes = b"PK\x03\x04\x14\x00\x00\x00binary-xlsx-body"
+
+    ok_route = respx.post(f"{BASE_URL}/api/words/import").mock(
+        return_value=httpx.Response(200, json={"imported": 4, "duplicates": 1, "skipped": 2}),
+    )
+
+    async with BackendAPIClient(base_url=BASE_URL, internal_api_key=SECRET_API_KEY) as client:
+        result = await client.import_words_file(
+            USER_ID,
+            "Deutsch_A2.xlsx",
+            xlsx_bytes,
+            content_type=xlsx_mime,
+        )
+
+    assert isinstance(result, WordImportResult)
+    assert result.imported == 4
+    assert result.duplicates == 1
+    assert result.skipped == 2
+
+    req = ok_route.calls.last.request
+    assert req.headers["X-Internal-API-Key"] == SECRET_API_KEY
+    assert req.headers["X-Telegram-User-Id"] == str(USER_ID)
+    assert b'filename="Deutsch_A2.xlsx"' in req.content
+    assert xlsx_mime.encode("ascii") in req.content
+    assert xlsx_bytes in req.content
+
+    # 400 Bad Request for corrupted .xlsx preserves Ukrainian backend detail
+    respx.post(f"{BASE_URL}/api/words/import").mock(
+        return_value=httpx.Response(
+            400,
+            json={"detail": "Не вдалося прочитати файл .xlsx: файл пошкоджений."},
+        ),
+    )
+    async with BackendAPIClient(base_url=BASE_URL, internal_api_key=SECRET_API_KEY) as client:
+        with pytest.raises(BadRequestError) as bad_exc:
+            await client.import_words_file(USER_ID, "bad.xlsx", b"bad", content_type=xlsx_mime)
+    assert bad_exc.value.status_code == 400
+    assert "пошкоджений" in (bad_exc.value.detail or "")
+
+    # 413 Content Too Large maps to APIClientError with status_code=413
+    respx.post(f"{BASE_URL}/api/words/import").mock(
+        return_value=httpx.Response(
+            413,
+            json={"detail": "Файл завеликий: максимальний розмір становить 2 МБ."},
+        ),
+    )
+    async with BackendAPIClient(base_url=BASE_URL, internal_api_key=SECRET_API_KEY) as client:
+        with pytest.raises(APIClientError) as big_exc:
+            await client.import_words_file(USER_ID, "big.xlsx", b"big", content_type=xlsx_mime)
+    assert big_exc.value.status_code == 413

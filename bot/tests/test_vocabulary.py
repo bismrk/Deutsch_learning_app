@@ -39,12 +39,16 @@ from bot_app.api_client import (
 from bot_app.config import BotSettings
 from bot_app.handlers.training import NON_TEXT_ANSWER_MESSAGE_UA, TrainingStates
 from bot_app.handlers.vocabulary import (
+    ALLOWED_IMPORT_EXTENSIONS,
     MAX_IMPORT_FILE_BYTES,
     VOCAB_CANCELLED_UA,
     VOCAB_EMPTY_FILE_UA,
+    VOCAB_EMPTY_TEXT_UA,
     VOCAB_FILE_DOWNLOAD_ERROR_UA,
+    VOCAB_FILE_PARSE_ERROR_UA,
     VOCAB_FILE_TOO_LARGE_UA,
     VOCAB_IMPORT_PROMPT_UA,
+    VOCAB_LEGACY_XLS_UA,
     VOCAB_MENU_TEXT_UA,
     VOCAB_SHEETS_ACCESS_ERROR_UA,
     VOCAB_SHEETS_BIND_PROMPT_UA,
@@ -56,6 +60,7 @@ from bot_app.handlers.vocabulary import (
     VOCAB_SHEETS_UPSTREAM_ERROR_UA,
     VOCAB_UNSUPPORTED_CONTENT_UA,
     VOCAB_UNSUPPORTED_EXTENSION_UA,
+    XLSX_CONTENT_TYPE,
     VocabStates,
     format_import_summary,
     handle_vocab_cancel,
@@ -341,9 +346,11 @@ async def test_text_import_handles_api_errors_preserving_state_and_cancel(
         ("words.txt", "text/plain"),
         ("vocab.csv", "text/csv"),
         ("UPPERCASE.CSV", "text/csv"),
+        ("words.xlsx", XLSX_CONTENT_TYPE),
+        ("VOCAB.XLSX", XLSX_CONTENT_TYPE),
     ],
 )
-async def test_document_import_valid_txt_and_csv_uploads_to_backend(
+async def test_document_import_valid_txt_csv_and_xlsx_uploads_to_backend(
     filename: str,
     expected_content_type: str,
 ) -> None:
@@ -409,7 +416,7 @@ async def test_document_import_exact_2mb_file_is_allowed() -> None:
 
 @pytest.mark.parametrize(
     "bad_filename",
-    ["book.pdf", "sheet.xlsx", "notes.docx", "archive.zip", "no_extension", ""],
+    ["book.pdf", "notes.docx", "archive.zip", "no_extension", ""],
 )
 async def test_document_import_rejects_unsupported_extension_before_download(
     bad_filename: str,
@@ -1040,3 +1047,215 @@ async def test_vocabulary_text_import_and_sheets_sync_end_to_end_via_api_client(
     assert "2" in msg.answer.await_args.args[0]
     sync_cb.answer.assert_awaited_once()
     assert sync_cb.message.answer.await_args.args[0] == VOCAB_SHEETS_TIMEOUT_UA
+
+
+def test_vocabulary_copy_constants_mention_xlsx_alongside_txt_and_csv() -> None:
+    expected_exts = frozenset({".txt", ".csv", ".xlsx"})
+    assert expected_exts == ALLOWED_IMPORT_EXTENSIONS
+    for text in (
+        VOCAB_MENU_TEXT_UA,
+        VOCAB_IMPORT_PROMPT_UA,
+        VOCAB_EMPTY_TEXT_UA,
+        VOCAB_UNSUPPORTED_EXTENSION_UA,
+        VOCAB_UNSUPPORTED_CONTENT_UA,
+        VOCAB_FILE_PARSE_ERROR_UA,
+    ):
+        assert ".txt" in text
+        assert ".csv" in text
+        assert ".xlsx" in text
+
+    assert ".xls" in VOCAB_LEGACY_XLS_UA
+    assert ".xlsx" in VOCAB_LEGACY_XLS_UA
+    assert ".csv" in VOCAB_LEGACY_XLS_UA
+    assert ".txt" in VOCAB_LEGACY_XLS_UA
+
+
+@pytest.mark.parametrize("legacy_filename", ["old_words.xls", "LEGACY.XLS"])
+async def test_document_import_rejects_legacy_xls_before_download_with_guidance(
+    legacy_filename: str,
+) -> None:
+    _, state = _make_fsm()
+    await state.set_state(VocabStates.waiting_import)
+    api_client = _make_api_mock()
+    bot = _make_bot_with_download(b"should-never-be-downloaded")
+    doc = _make_document(file_name=legacy_filename, file_size=512)
+    message = _make_message(document=doc, bot=bot)
+
+    await handle_vocab_import_document(
+        message=message,
+        state=state,
+        api_client=api_client,
+        settings=_make_settings(),
+    )
+
+    bot.download.assert_not_awaited()
+    api_client.import_words_file.assert_not_awaited()
+    assert await state.get_state() == VocabStates.waiting_import.state
+    assert message.answer.await_args.args[0] == VOCAB_LEGACY_XLS_UA
+    markup = message.answer.await_args.kwargs["reply_markup"]
+    assert _flatten_inline_callbacks(markup) == [VOCAB_CANCEL_CALLBACK]
+
+
+async def test_document_import_xlsx_enforces_pre_and_post_download_2mb_limits() -> None:
+    # 1. Pre-download check rejects > 2 MiB .xlsx without downloading
+    _, state = _make_fsm()
+    await state.set_state(VocabStates.waiting_import)
+    api_client = _make_api_mock()
+    bot = _make_bot_with_download(b"should-never-download")
+    oversized_doc = _make_document(file_name="huge.xlsx", file_size=MAX_IMPORT_FILE_BYTES + 1)
+    msg_pre = _make_message(document=oversized_doc, bot=bot)
+
+    await handle_vocab_import_document(
+        message=msg_pre,
+        state=state,
+        api_client=api_client,
+        settings=_make_settings(),
+    )
+
+    bot.download.assert_not_awaited()
+    api_client.import_words_file.assert_not_awaited()
+    assert msg_pre.answer.await_args.args[0] == VOCAB_FILE_TOO_LARGE_UA
+    assert await state.get_state() == VocabStates.waiting_import.state
+
+    # 2. Post-download check rejects > 2 MiB .xlsx when Telegram omits file_size
+    bot_post = _make_bot_with_download(b"PK\x03\x04" + b"0" * MAX_IMPORT_FILE_BYTES)
+    unknown_size_doc = _make_document(file_name="HUGE.XLSX", file_size=None)
+    msg_post = _make_message(document=unknown_size_doc, bot=bot_post)
+
+    await handle_vocab_import_document(
+        message=msg_post,
+        state=state,
+        api_client=api_client,
+        settings=_make_settings(),
+    )
+
+    bot_post.download.assert_awaited_once()
+    api_client.import_words_file.assert_not_awaited()
+    assert msg_post.answer.await_args.args[0] == VOCAB_FILE_TOO_LARGE_UA
+    assert await state.get_state() == VocabStates.waiting_import.state
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected_fragment"),
+    [
+        (
+            BadRequestError(
+                "Не вдалося прочитати файл .xlsx: файл пошкоджений.",
+                status_code=400,
+                detail="Не вдалося прочитати файл .xlsx: файл пошкоджений.",
+            ),
+            "пошкоджений",
+        ),
+        (
+            BadRequestError(
+                "Файл .xlsx перевищує безпечний ліміт розпакованого розміру (20 МБ).",
+                status_code=400,
+                detail="Файл .xlsx перевищує безпечний ліміт розпакованого розміру (20 МБ).",
+            ),
+            "20 мб",
+        ),
+        (
+            APIClientError("Too large", status_code=413),
+            "2 мб",
+        ),
+        (
+            ValidationAPIError(
+                "Завантажений файл порожній.",
+                status_code=422,
+                detail="Завантажений файл порожній.",
+            ),
+            "порожній",
+        ),
+        (
+            APIUnavailableError(UNAVAILABLE_ERROR_MESSAGE_UA, status_code=503),
+            "недоступний",
+        ),
+    ],
+)
+async def test_document_import_xlsx_handles_backend_errors_and_keeps_state(
+    exc: Exception,
+    expected_fragment: str,
+) -> None:
+    _, state = _make_fsm()
+    await state.set_state(VocabStates.waiting_import)
+    api_client = _make_api_mock()
+    api_client.import_words_file.side_effect = exc
+    bot = _make_bot_with_download(b"PK\x03\x04corrupted")
+    doc = _make_document(file_name="broken.xlsx", file_size=13)
+    message = _make_message(document=doc, bot=bot)
+
+    await handle_vocab_import_document(
+        message=message,
+        state=state,
+        api_client=api_client,
+        settings=_make_settings(),
+    )
+
+    assert await state.get_state() == VocabStates.waiting_import.state
+    reply = message.answer.await_args.args[0]
+    assert expected_fragment in reply.lower()
+    markup = message.answer.await_args.kwargs["reply_markup"]
+    assert _flatten_inline_callbacks(markup) == [VOCAB_CANCEL_CALLBACK]
+
+
+async def test_document_import_xlsx_zero_imported_and_skipped_keeps_state_with_cancel() -> None:
+    _, state = _make_fsm()
+    await state.set_state(VocabStates.waiting_import)
+    api_client = _make_api_mock()
+    api_client.import_words_file.return_value = WordImportResult(
+        imported=0,
+        duplicates=0,
+        skipped=4,
+    )
+    bot = _make_bot_with_download(b"PK\x03\x04dummy-xlsx")
+    doc = _make_document(file_name="bad_rows.xlsx", file_size=14)
+    message = _make_message(document=doc, bot=bot)
+
+    await handle_vocab_import_document(
+        message=message,
+        state=state,
+        api_client=api_client,
+        settings=_make_settings(),
+    )
+
+    assert await state.get_state() == VocabStates.waiting_import.state
+    reply = message.answer.await_args.args[0]
+    assert "0" in reply
+    assert "4" in reply
+    markup = message.answer.await_args.kwargs["reply_markup"]
+    assert _flatten_inline_callbacks(markup) == [VOCAB_CANCEL_CALLBACK]
+
+
+@respx.mock
+async def test_document_import_xlsx_end_to_end_via_api_client_sends_filename_and_mime() -> None:
+    xlsx_bytes = b"PK\x03\x04fake-xlsx-payload"
+    import_route = respx.post(f"{BASE_URL}/api/words/import").mock(
+        return_value=httpx.Response(200, json={"imported": 3, "duplicates": 1, "skipped": 0}),
+    )
+    _, state = _make_fsm()
+    await state.set_state(VocabStates.waiting_import)
+    bot = _make_bot_with_download(xlsx_bytes)
+    doc = _make_document(file_name="MyDeck.XLSX", file_size=len(xlsx_bytes))
+    msg = _make_message(document=doc, bot=bot)
+
+    async with BackendAPIClient(base_url=BASE_URL, internal_api_key=SECRET_API_KEY) as client:
+        await handle_vocab_import_document(
+            message=msg,
+            state=state,
+            api_client=client,
+            settings=_make_settings(),
+        )
+
+    assert import_route.called
+    request = import_route.calls.last.request
+    assert request.headers["X-Internal-API-Key"] == SECRET_API_KEY
+    assert request.headers["X-Telegram-User-Id"] == str(USER_ID)
+    assert b'filename="MyDeck.XLSX"' in request.content
+    assert XLSX_CONTENT_TYPE.encode("ascii") in request.content
+    assert xlsx_bytes in request.content
+    assert await state.get_state() is None
+    reply = msg.answer.await_args.args[0]
+    assert "3" in reply
+    assert "1" in reply
+    assert "0" in reply
+    assert isinstance(msg.answer.await_args.kwargs["reply_markup"], ReplyKeyboardMarkup)
