@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 
 from app.api import api_router
+from app.api.sessions import router as sessions_router
 from app.api.users import router as users_router
 from app.api.words import router as words_router
 from app.config import Settings, get_settings
@@ -18,6 +19,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(api_router)
     application.include_router(users_router, prefix="/api")
     application.include_router(words_router, prefix="/api")
+    application.include_router(sessions_router, prefix="/api")
     return application
 
 
