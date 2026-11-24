@@ -2,28 +2,38 @@
 
 from __future__ import annotations
 
+import io
+import zipfile
 from collections.abc import AsyncIterator
+from datetime import date, datetime
 from typing import Any
+from unittest.mock import MagicMock
 
 import httpx
+import openpyxl
 import pytest
 import respx
 
 from app.core.sheets_sync import (
     MAX_IMPORT_BYTES,
+    MAX_XLSX_UNCOMPRESSED_BYTES,
+    MAX_XLSX_ZIP_ENTRIES,
     InvalidImportEncodingError,
     InvalidSheetsUrlError,
     ParsedWordEntry,
+    ParseResult,
     PayloadTooLargeError,
     SheetsAccessError,
     SheetsTimeoutError,
     SheetsUpstreamError,
+    XlsxParseError,
     build_google_sheets_csv_url,
     decode_utf8_bytes,
     fetch_google_sheets_csv,
     normalize_word_key,
     parse_vocabulary_bytes,
     parse_vocabulary_text,
+    parse_xlsx_bytes,
     sync_google_sheet,
     validate_redirect_url,
 )
@@ -616,3 +626,346 @@ def test_build_google_sheets_csv_url_rejects_non_string_types() -> None:
     for bad in bad_inputs:
         with pytest.raises(InvalidSheetsUrlError):
             build_google_sheets_csv_url(bad)
+
+
+# ---------------------------------------------------------------------------
+# Excel (.xlsx) parser unit & security tests
+# ---------------------------------------------------------------------------
+
+
+def _build_xlsx_bytes(
+    sheets: list[tuple[str, list[list[Any]]]],
+    *,
+    active_index: int = 0,
+) -> bytes:
+    workbook = openpyxl.Workbook()
+    first_title, first_rows = sheets[0]
+    ws0 = workbook.active
+    assert ws0 is not None
+    ws0.title = first_title
+    for row in first_rows:
+        ws0.append(row)
+
+    for title, rows in sheets[1:]:
+        ws = workbook.create_sheet(title=title)
+        for row in rows:
+            ws.append(row)
+
+    workbook.active = active_index
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    workbook.close()
+    return buffer.getvalue()
+
+
+def test_parse_xlsx_reads_2_and_3_columns_ignores_4th_plus_and_trims_whitespace() -> None:
+    xlsx = _build_xlsx_bytes(
+        [
+            (
+                "Vocabulary",
+                [
+                    ["  word_de  ", "  translation_ua  ", "part_of_speech", "Notes", "Extra"],
+                    ["  der Zug  ", "  потяг  ", "  noun  ", "ignored col 4", "ignored col 5"],
+                    ["die Verspätung", "затримка"],
+                    ["  E-Mail  ", "  електронна пошта  ", "   ", "note"],
+                    ["das Treffen", "зустріч", "noun", None, "trailing"],
+                ],
+            ),
+        ],
+    )
+
+    result = parse_xlsx_bytes(xlsx)
+
+    assert result.skipped == 0
+    assert result.entries == [
+        ParsedWordEntry("der Zug", "потяг", "noun"),
+        ParsedWordEntry("die Verspätung", "затримка", None),
+        ParsedWordEntry("E-Mail", "електронна пошта", None),
+        ParsedWordEntry("das Treffen", "зустріч", "noun"),
+    ]
+
+
+def test_parse_xlsx_supports_single_column_text_pairs_with_header_and_skipped() -> None:
+    xlsx = _build_xlsx_bytes(
+        [
+            (
+                "SingleCol",
+                [
+                    ["Слово - Переклад"],
+                    ["der Zug - потяг"],
+                    ["die Verspätung; затримка; noun"],
+                    ["  E-Mail — електронна пошта  "],
+                    [None],
+                    ["   "],
+                    ["E-Mail"],
+                    ["некоректний рядок"],
+                ],
+            ),
+        ],
+    )
+
+    result = parse_xlsx_bytes(xlsx)
+
+    assert result.entries == [
+        ParsedWordEntry("der Zug", "потяг", None),
+        ParsedWordEntry("die Verspätung", "затримка", "noun"),
+        ParsedWordEntry("E-Mail", "електронна пошта", None),
+    ]
+    assert result.skipped == 2
+
+
+def test_parse_xlsx_supports_single_column_sheet_with_trailing_empty_column() -> None:
+    xlsx = _build_xlsx_bytes(
+        [
+            (
+                "PaddedSingleCol",
+                [
+                    ["der Zug - потяг", None],
+                    ["das Haus; будинок; noun", "   "],
+                ],
+            ),
+        ],
+    )
+
+    result = parse_xlsx_bytes(xlsx)
+
+    assert result.skipped == 0
+    assert result.entries == [
+        ParsedWordEntry("der Zug", "потяг", None),
+        ParsedWordEntry("das Haus", "будинок", "noun"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("col1", "col2"),
+    [
+        ("word_de", "translation_ua"),
+        ("Word", "Translation"),
+        ("Слово", "Переклад"),
+        ("Німецьке слово", "Українською"),
+        ("WORD (DE)", "TRANSLATION (UA)"),
+        ("Deutsch", "Ukrainisch"),
+    ],
+)
+def test_parse_xlsx_skips_first_non_empty_header_row_without_incrementing_skipped(
+    col1: str,
+    col2: str,
+) -> None:
+    xlsx = _build_xlsx_bytes(
+        [
+            (
+                "Sheet1",
+                [
+                    [None, None],
+                    [col1, col2, "Частина мови"],
+                    ["der Tisch", "стіл", "noun"],
+                ],
+            ),
+        ],
+    )
+
+    result = parse_xlsx_bytes(xlsx)
+
+    assert result.skipped == 0
+    assert result.entries == [ParsedWordEntry("der Tisch", "стіл", "noun")]
+
+
+def test_parse_xlsx_does_not_skip_real_word_das_wort() -> None:
+    xlsx = _build_xlsx_bytes(
+        [
+            (
+                "Sheet1",
+                [
+                    ["das Wort", "слово"],
+                    ["der Zug", "потяг"],
+                ],
+            ),
+        ],
+    )
+
+    result = parse_xlsx_bytes(xlsx)
+
+    assert result.skipped == 0
+    assert result.entries == [
+        ParsedWordEntry("das Wort", "слово", None),
+        ParsedWordEntry("der Zug", "потяг", None),
+    ]
+
+
+def test_parse_xlsx_handles_blank_rows_missing_values_uncached_formulas_and_non_string_cells(
+) -> None:
+    xlsx = _build_xlsx_bytes(
+        [
+            (
+                "Mixed",
+                [
+                    ["word_de", "translation_ua", "part_of_speech"],
+                    [None, None, None],
+                    ["   ", "", None],
+                    ["der Zug", "=A2", "noun"],  # uncached formula -> None in data_only=True
+                    ["der Zug, die Züge", None],  # missing translation with comma in word_de
+                    [None, "лише переклад"],
+                    [42, "сорок два", 1],
+                    ["der Preis", 3.5, True],
+                    ["die Zahl", 100.0, False],
+                    [date(2026, 6, 15), "дата"],
+                    [datetime(2026, 6, 15, 14, 30, 0), "час"],
+                ],
+            ),
+        ],
+    )
+
+    result = parse_xlsx_bytes(xlsx)
+
+    assert result.skipped == 3
+    assert result.entries == [
+        ParsedWordEntry("42", "сорок два", "1"),
+        ParsedWordEntry("der Preis", "3.5", "True"),
+        ParsedWordEntry("die Zahl", "100", "False"),
+        ParsedWordEntry("2026-06-15", "дата", None),
+        ParsedWordEntry("2026-06-15T14:30:00", "час", None),
+    ]
+
+
+def test_parse_xlsx_reads_only_active_sheet_and_handles_empty_or_header_only_sheets() -> None:
+    multi_xlsx = _build_xlsx_bytes(
+        [
+            ("Inactive1", [["das Haus", "будинок"]]),
+            ("ActiveVocab", [["Слово", "Переклад"], ["der Bahnhof", "вокзал"]]),
+            ("Inactive2", [["die Katze", "кішка"]]),
+        ],
+        active_index=1,
+    )
+    multi_result = parse_xlsx_bytes(multi_xlsx)
+    assert multi_result == ParseResult(
+        entries=[ParsedWordEntry("der Bahnhof", "вокзал", None)],
+        skipped=0,
+    )
+
+    empty_xlsx = _build_xlsx_bytes([("Empty", [])])
+    assert parse_xlsx_bytes(empty_xlsx) == ParseResult(entries=[], skipped=0)
+
+    header_only_xlsx = _build_xlsx_bytes([("HeaderOnly", [["Word", "Translation"]])])
+    assert parse_xlsx_bytes(header_only_xlsx) == ParseResult(entries=[], skipped=0)
+
+
+def test_parse_xlsx_uses_read_only_data_only_falls_back_to_first_sheet_and_always_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    valid_xlsx = _build_xlsx_bytes([("Sheet1", [["der Zug", "потяг"]])])
+
+    # 1. Active is None -> falls back to worksheets[0], verifies kwargs & close() called
+    fake_sheet = MagicMock()
+    fake_sheet.iter_rows.return_value = iter([("der Zug", "потяг")])
+    fake_wb = MagicMock()
+    fake_wb.active = None
+    fake_wb.worksheets = [fake_sheet]
+
+    recorded_kwargs: list[dict[str, Any]] = []
+
+    def fake_load_workbook(_file: Any, **kwargs: Any) -> Any:
+        recorded_kwargs.append(kwargs)
+        return fake_wb
+
+    monkeypatch.setattr("app.core.sheets_sync.openpyxl.load_workbook", fake_load_workbook)
+
+    res = parse_xlsx_bytes(valid_xlsx)
+    assert res == ParseResult(entries=[ParsedWordEntry("der Zug", "потяг", None)], skipped=0)
+    assert recorded_kwargs == [{"read_only": True, "data_only": True}]
+    fake_wb.close.assert_called_once()
+
+    # 2. Exception during row iteration -> raises XlsxParseError AND still calls workbook.close()
+    failing_sheet = MagicMock()
+    failing_sheet.iter_rows.side_effect = RuntimeError("corrupt XML stream")
+    failing_wb = MagicMock()
+    failing_wb.active = failing_sheet
+    failing_wb.worksheets = [failing_sheet]
+
+    monkeypatch.setattr(
+        "app.core.sheets_sync.openpyxl.load_workbook",
+        lambda _file, **_kw: failing_wb,
+    )
+
+    with pytest.raises(XlsxParseError):
+        parse_xlsx_bytes(valid_xlsx)
+
+    failing_wb.close.assert_called_once()
+
+
+def test_parse_xlsx_rejects_oversized_raw_bytes() -> None:
+    oversized = b"x" * (MAX_IMPORT_BYTES + 1)
+    with pytest.raises(PayloadTooLargeError, match="2 МБ"):
+        parse_xlsx_bytes(oversized)
+
+
+def test_parse_xlsx_blocks_zip_bombs_and_too_many_entries_before_openpyxl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    load_called = False
+
+    def fail_if_called(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal load_called
+        load_called = True
+        raise AssertionError("openpyxl.load_workbook must not be called for unsafe ZIPs")
+
+    monkeypatch.setattr("app.core.sheets_sync.openpyxl.load_workbook", fail_if_called)
+
+    # 1. ZIP bomb: > 20 MiB uncompressed zeros compressed to ~21 KiB
+    bomb_buf = io.BytesIO()
+    with zipfile.ZipFile(bomb_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("xl/worksheets/sheet1.xml", b"0" * (MAX_XLSX_UNCOMPRESSED_BYTES + 1024))
+    bomb_bytes = bomb_buf.getvalue()
+    assert len(bomb_bytes) < MAX_IMPORT_BYTES
+
+    with pytest.raises(XlsxParseError, match="20 МБ"):
+        parse_xlsx_bytes(bomb_bytes)
+    assert not load_called
+
+    # 2. Too many ZIP entries (> 512)
+    many_buf = io.BytesIO()
+    with zipfile.ZipFile(many_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for idx in range(MAX_XLSX_ZIP_ENTRIES + 1):
+            zf.writestr(f"entry_{idx}.xml", b"<x/>")
+    many_bytes = many_buf.getvalue()
+    assert len(many_bytes) < MAX_IMPORT_BYTES
+
+    with pytest.raises(XlsxParseError):
+        parse_xlsx_bytes(many_bytes)
+    assert not load_called
+
+
+def test_parse_xlsx_rejects_corrupted_random_renamed_txt_legacy_xls_and_broken_xml() -> None:
+    # 1. Random bytes / truncated garbage
+    with pytest.raises(XlsxParseError):
+        parse_xlsx_bytes(b"\x00\xff\x13\x37not-a-zip-file")
+
+    # 2. Renamed plain text (.txt -> .xlsx)
+    with pytest.raises(XlsxParseError):
+        parse_xlsx_bytes("der Zug - потяг\n".encode())
+
+    # 3. Legacy .xls (OLE2 compound file signature) renamed to .xlsx
+    with pytest.raises(XlsxParseError, match=r"\.xlsx"):
+        parse_xlsx_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64)
+
+    # 4. Valid ZIP archive that is NOT an .xlsx workbook (e.g. renamed .zip / .docx)
+    plain_zip = io.BytesIO()
+    with zipfile.ZipFile(plain_zip, mode="w") as zf:
+        zf.writestr("hello.txt", "world")
+    with pytest.raises(XlsxParseError):
+        parse_xlsx_bytes(plain_zip.getvalue())
+
+    # 5. Valid .xlsx structure with corrupted XML inside xl/worksheets/sheet1.xml
+    valid_xlsx = _build_xlsx_bytes([("Sheet1", [["der Zug", "потяг"]])])
+    corrupted_xml_buf = io.BytesIO()
+    with (
+        zipfile.ZipFile(io.BytesIO(valid_xlsx), mode="r") as src,
+        zipfile.ZipFile(corrupted_xml_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as dst,
+    ):
+        for item in src.infolist():
+            if item.filename == "xl/worksheets/sheet1.xml":
+                dst.writestr(item, b"<worksheet><sheetData><broken")
+            else:
+                dst.writestr(item, src.read(item.filename))
+
+    with pytest.raises(XlsxParseError):
+        parse_xlsx_bytes(corrupted_xml_buf.getvalue())

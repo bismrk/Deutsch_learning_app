@@ -1,15 +1,20 @@
-"""Vocabulary parser and SSRF-hardened Google Sheets public CSV synchronizer."""
+"""Vocabulary parser (.txt/.csv/.xlsx) and SSRF-hardened Google Sheets CSV synchronizer."""
 
 from __future__ import annotations
 
 import csv
 import io
+import math
 import re
+import zipfile
+import zlib
 from dataclasses import dataclass
-from typing import Literal
+from datetime import date, datetime, time
+from typing import Any, Literal
 from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlsplit
 
 import httpx
+import openpyxl
 
 ALLOWED_SHEETS_HOST = "docs.google.com"
 ALLOWED_REDIRECT_SUFFIX = ".googleusercontent.com"
@@ -17,6 +22,10 @@ GOOGLE_ACCOUNTS_HOST = "accounts.google.com"
 
 MAX_SHEETS_URL_LENGTH = 2048
 MAX_IMPORT_BYTES = 2 * 1024 * 1024  # 2 MiB
+MAX_XLSX_UNCOMPRESSED_BYTES = 20 * 1024 * 1024  # 20 MiB
+MAX_XLSX_ZIP_ENTRIES = 512
+_XLSX_ZIP_READ_CHUNK_SIZE = 64 * 1024  # 64 KiB
+_OLE2_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 DEFAULT_SHEETS_TIMEOUT_SECONDS = 10.0
 MAX_REDIRECTS = 5
 
@@ -102,6 +111,10 @@ class PayloadTooLargeError(SheetsSyncError):
 
 class InvalidImportEncodingError(SheetsSyncError):
     """Raised when an imported payload is not valid UTF-8 text or contains binary bytes."""
+
+
+class XlsxParseError(SheetsSyncError):
+    """Raised when an uploaded .xlsx archive is corrupted, unsafe (ZIP bomb), or invalid."""
 
 
 class SheetsTimeoutError(SheetsSyncError):
@@ -375,6 +388,184 @@ def parse_vocabulary_bytes(
         raise PayloadTooLargeError("Файл завеликий: максимальний розмір становить 2 МБ.")
     text = decode_utf8_bytes(data)
     return parse_vocabulary_text(text, format_hint=format_hint)
+
+
+def _xlsx_cell_to_str(value: object) -> str:
+    """Safely convert any Excel cell value (str, int, float, bool, date/datetime, None) to str."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        if "\x00" in value:
+            raise XlsxParseError("Файл .xlsx містить неприпустимі бінарні символи.")
+        return value.strip()
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        if math.isfinite(value) and value.is_integer():
+            return str(int(value))
+        return str(value)
+    if isinstance(value, datetime):
+        if (
+            value.hour == 0
+            and value.minute == 0
+            and value.second == 0
+            and value.microsecond == 0
+        ):
+            return value.date().isoformat()
+        return value.isoformat()
+    if isinstance(value, (date, time)):
+        return value.isoformat()
+    rendered = str(value).strip()
+    if "\x00" in rendered:
+        raise XlsxParseError("Файл .xlsx містить неприпустимі бінарні символи.")
+    return rendered
+
+
+def _validate_xlsx_zip_bytes(
+    data: bytes,
+    *,
+    max_uncompressed_bytes: int = MAX_XLSX_UNCOMPRESSED_BYTES,
+    max_zip_entries: int = MAX_XLSX_ZIP_ENTRIES,
+) -> None:
+    """Validate ZIP archive structure and defend against ZIP bombs before invoking openpyxl."""
+    if data.startswith(_OLE2_MAGIC):
+        raise XlsxParseError(
+            "Застарілий або захищений паролем формат Excel (.xls) не підтримується. "
+            "Збережіть таблицю як .xlsx, .csv або .txt.",
+        )
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(data), mode="r") as archive:
+            infos = archive.infolist()
+            if not infos:
+                raise XlsxParseError(
+                    "Некоректний або пошкоджений файл .xlsx. "
+                    "Переконайтеся, що файл збережено у форматі Excel (.xlsx).",
+                )
+            if len(infos) > max_zip_entries:
+                raise XlsxParseError(
+                    "Файл .xlsx містить занадто багато внутрішніх елементів "
+                    "і не може бути безпечно оброблений.",
+                )
+
+            declared_total = 0
+            for info in infos:
+                if info.file_size < 0:
+                    raise XlsxParseError("Некоректний або пошкоджений файл .xlsx.")
+                declared_total += info.file_size
+                if declared_total > max_uncompressed_bytes:
+                    raise XlsxParseError(
+                        "Файл .xlsx перевищує безпечний ліміт розпакованого розміру (20 МБ).",
+                    )
+
+            actual_total = 0
+            for info in infos:
+                if info.is_dir():
+                    continue
+                with archive.open(info, "r") as member:
+                    while True:
+                        chunk = member.read(_XLSX_ZIP_READ_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        actual_total += len(chunk)
+                        if actual_total > max_uncompressed_bytes:
+                            raise XlsxParseError(
+                                "Файл .xlsx перевищує безпечний ліміт розпакованого розміру "
+                                "(20 МБ).",
+                            )
+    except XlsxParseError:
+        raise
+    except (
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+        zlib.error,
+        RuntimeError,
+        OSError,
+        EOFError,
+        ValueError,
+    ) as exc:
+        raise XlsxParseError(
+            "Не вдалося прочитати файл .xlsx: файл пошкоджений, захищений паролем "
+            "або не є дійсною таблицею Excel (.xlsx).",
+        ) from exc
+
+
+def _parse_xlsx_sheet(sheet: Any) -> ParseResult:
+    """Parse rows from a single openpyxl worksheet (2-3 columns or 1-column text pairs)."""
+    non_empty_rows: list[tuple[str, str, str]] = []
+    has_multi_col = False
+
+    for raw_row in sheet.iter_rows(values_only=True):
+        if not raw_row:
+            continue
+        c0 = _xlsx_cell_to_str(raw_row[0]) if len(raw_row) >= 1 else ""
+        c1 = _xlsx_cell_to_str(raw_row[1]) if len(raw_row) >= 2 else ""
+        c2 = _xlsx_cell_to_str(raw_row[2]) if len(raw_row) >= 3 else ""
+        if not (c0 or c1 or c2) and not any(_xlsx_cell_to_str(cell) for cell in raw_row[3:]):
+            continue
+        if c1 or c2:
+            has_multi_col = True
+        non_empty_rows.append((c0, c1, c2))
+
+    entries: list[ParsedWordEntry] = []
+    skipped = 0
+
+    for index, (c0, c1, c2) in enumerate(non_empty_rows):
+        if has_multi_col:
+            entry = _extract_entry_from_columns([c0, c1, c2])
+        else:
+            entry = _parse_single_text_line(c0)
+
+        if entry is None:
+            skipped += 1
+            continue
+        if index == 0 and _is_header_row(entry.word_de, entry.translation_ua):
+            continue
+        entries.append(entry)
+
+    return ParseResult(entries=entries, skipped=skipped)
+
+
+def parse_xlsx_bytes(
+    data: bytes,
+    *,
+    max_bytes: int = MAX_IMPORT_BYTES,
+    max_uncompressed_bytes: int = MAX_XLSX_UNCOMPRESSED_BYTES,
+    max_zip_entries: int = MAX_XLSX_ZIP_ENTRIES,
+) -> ParseResult:
+    """Validate size/ZIP safety and parse vocabulary entries from an ``.xlsx`` workbook."""
+    if len(data) > max_bytes:
+        raise PayloadTooLargeError("Файл завеликий: максимальний розмір становить 2 МБ.")
+
+    _validate_xlsx_zip_bytes(
+        data,
+        max_uncompressed_bytes=max_uncompressed_bytes,
+        max_zip_entries=max_zip_entries,
+    )
+
+    workbook = None
+    try:
+        workbook = openpyxl.load_workbook(
+            io.BytesIO(data),
+            read_only=True,
+            data_only=True,
+        )
+        sheet = workbook.active
+        if sheet is None:
+            sheet = workbook.worksheets[0] if workbook.worksheets else None
+        if sheet is None:
+            return ParseResult(entries=[], skipped=0)
+        return _parse_xlsx_sheet(sheet)
+    except SheetsSyncError:
+        raise
+    except Exception as exc:
+        raise XlsxParseError(
+            "Не вдалося прочитати файл .xlsx: файл пошкоджений або не є дійсною таблицею "
+            "Excel (.xlsx).",
+        ) from exc
+    finally:
+        if workbook is not None:
+            workbook.close()
 
 
 def _validate_base_https_url(raw_url: str, *, error_context: str) -> tuple[str, str, str, str, str]:
@@ -702,6 +893,8 @@ __all__ = [
     "MAX_IMPORT_BYTES",
     "MAX_REDIRECTS",
     "MAX_SHEETS_URL_LENGTH",
+    "MAX_XLSX_UNCOMPRESSED_BYTES",
+    "MAX_XLSX_ZIP_ENTRIES",
     "InvalidImportEncodingError",
     "InvalidSheetsUrlError",
     "ParseFormatHint",
@@ -712,12 +905,14 @@ __all__ = [
     "SheetsSyncError",
     "SheetsTimeoutError",
     "SheetsUpstreamError",
+    "XlsxParseError",
     "build_google_sheets_csv_url",
     "decode_utf8_bytes",
     "fetch_google_sheets_csv",
     "normalize_word_key",
     "parse_vocabulary_bytes",
     "parse_vocabulary_text",
+    "parse_xlsx_bytes",
     "sync_google_sheet",
     "validate_redirect_url",
 ]

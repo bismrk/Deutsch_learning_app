@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import io
 import json
+import zipfile
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 from urllib.parse import urlencode
 
 import httpx
+import openpyxl
 import pytest
 import respx
 from httpx import ASGITransport, AsyncClient
@@ -20,7 +23,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_utc_now
 from app.config import Settings
 from app.core.auth import TELEGRAM_WEBAPP_HMAC_KEY
-from app.core.sheets_sync import MAX_IMPORT_BYTES
+from app.core.sheets_sync import (
+    MAX_IMPORT_BYTES,
+    MAX_XLSX_UNCOMPRESSED_BYTES,
+    MAX_XLSX_ZIP_ENTRIES,
+)
 from app.db.base import get_db
 from app.db.models import Deck, User, UserWordFSRS, Word
 from app.db.users import DEFAULT_DECK_LEVEL, DEFAULT_DECK_TITLE
@@ -1120,3 +1127,328 @@ async def test_get_words_rejects_out_of_range_pagination_offset_with_422_not_500
     )
     assert max_ok.status_code == 200
     assert max_ok.json() == {"items": [], "total": 1}
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL integration tests: Excel (.xlsx) upload import
+# ---------------------------------------------------------------------------
+
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def _make_xlsx_bytes(
+    sheets: list[tuple[str, list[list[Any]]]],
+    *,
+    active_index: int = 0,
+) -> bytes:
+    wb = openpyxl.Workbook()
+    first_title, first_rows = sheets[0]
+    ws0 = wb.active
+    assert ws0 is not None
+    ws0.title = first_title
+    for row in first_rows:
+        ws0.append(row)
+    for title, rows in sheets[1:]:
+        ws = wb.create_sheet(title=title)
+        for row in rows:
+            ws.append(row)
+    wb.active = active_index
+    buf = io.BytesIO()
+    wb.save(buf)
+    wb.close()
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("auth_mode", ["tma", "bot"])
+@pytest.mark.parametrize("filename", ["vocab.xlsx", "VOCAB.XLSX"])
+async def test_import_xlsx_persists_words_dedup_fsrs_and_skips_utf8_decode(
+    words_client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    auth_mode: str,
+    filename: str,
+) -> None:
+    user_id = USER_A_ID if auth_mode == "tma" else USER_B_ID
+    headers = (
+        build_tma_headers(user_id) if auth_mode == "tma" else build_bot_headers(user_id)
+    )
+
+    # Ensure decode_utf8_bytes is NEVER called when uploading .xlsx
+    def fail_decode(_data: bytes) -> str:
+        raise AssertionError("decode_utf8_bytes must not be called on .xlsx uploads")
+
+    monkeypatch.setattr("app.api.words.decode_utf8_bytes", fail_decode)
+
+    xlsx_v1 = _make_xlsx_bytes(
+        [
+            ("IgnoredSheet", [["der Mond", "місяць"]]),
+            (
+                "ActiveVocab",
+                [
+                    [None, None, None],
+                    ["Word (DE)", "Translation (UA)", "Part of speech", "ExtraCol"],
+                    ["  der Zug  ", "  потяг  ", "  noun  ", "ignored"],
+                    ["E-Mail", "електронна пошта"],
+                    ["  DER ZUG ", "потяг дубль у файлі", "noun"],
+                    ["die Verspätung", "=A3", "noun"],  # uncached formula -> skipped
+                    [42, "сорок два", True],
+                    [date(2026, 6, 15), "дата"],
+                    [None, None, None],
+                ],
+            ),
+        ],
+        active_index=1,
+    )
+
+    resp_1 = await words_client.post(
+        "/api/words/import",
+        headers=headers,
+        files={"file": (filename, xlsx_v1, XLSX_MIME)},
+    )
+    assert resp_1.status_code == 200
+    assert resp_1.json() == {"imported": 4, "duplicates": 1, "skipped": 1}
+
+    words_resp = await words_client.get("/api/words", headers=headers)
+    assert words_resp.status_code == 200
+    words_data = words_resp.json()
+    assert words_data["total"] == 4
+    by_word = {item["word_de"]: item for item in words_data["items"]}
+    assert set(by_word.keys()) == {"der Zug", "E-Mail", "42", "2026-06-15"}
+    assert "der Mond" not in by_word
+    assert by_word["der Zug"]["part_of_speech"] == "noun"
+    assert by_word["E-Mail"]["part_of_speech"] is None
+
+    for item in words_data["items"]:
+        assert item["source"] == "file"
+        assert item["state"] == 0
+        assert item["reps"] == 0
+        assert datetime.fromisoformat(item["due_at"]) == FIXED_NOW
+
+    # Advance FSRS card on "der Zug" and re-import duplicate + 1-column text-pair sheet
+    zug_id = by_word["der Zug"]["id"]
+    card = await db_session.get(UserWordFSRS, (user_id, zug_id))
+    assert card is not None
+    card.state = 2
+    card.stability = 14.0
+    card.difficulty = 5.1
+    card.reps = 4
+    card.last_review = FIXED_REVIEW_AT
+    card.due_at = FIXED_FUTURE_DUE
+    await db_session.commit()
+
+    xlsx_v2 = _make_xlsx_bytes(
+        [
+            (
+                "OneCol",
+                [
+                    ["Слово - Переклад"],
+                    ["  der zug  - потяг (дублікат із БД)"],
+                    ["das Treffen; зустріч; noun"],
+                    ["E-Mail"],  # skipped
+                ],
+            ),
+        ],
+    )
+    resp_2 = await words_client.post(
+        "/api/words/import",
+        headers=headers,
+        files={"file": ("single_col.xlsx", xlsx_v2, "application/octet-stream")},
+    )
+    assert resp_2.status_code == 200
+    assert resp_2.json() == {"imported": 1, "duplicates": 1, "skipped": 1}
+
+    # Existing FSRS card must be preserved intact
+    db_session.expire_all()
+    preserved = await db_session.get(UserWordFSRS, (user_id, zug_id))
+    assert preserved is not None
+    assert preserved.state == 2
+    assert preserved.stability == pytest.approx(14.0)
+    assert preserved.reps == 4
+    assert preserved.due_at == FIXED_FUTURE_DUE
+
+    # Empty valid workbook & header-only workbook return 200 with zero counters
+    empty_wb = _make_xlsx_bytes([("Empty", [])])
+    empty_wb_resp = await words_client.post(
+        "/api/words/import",
+        headers=headers,
+        files={"file": ("empty_sheet.xlsx", empty_wb, XLSX_MIME)},
+    )
+    assert empty_wb_resp.status_code == 200
+    assert empty_wb_resp.json() == {"imported": 0, "duplicates": 0, "skipped": 0}
+
+
+async def test_import_xlsx_rejects_empty_legacy_xls_unsupported_corrupt_zipbomb_oversize(
+    words_client: AsyncClient,
+) -> None:
+    headers = build_bot_headers(USER_A_ID)
+    valid_xlsx = _make_xlsx_bytes([("Sheet1", [["der Zug", "потяг"]])])
+
+    # 1. 0-byte .xlsx -> 422 "Завантажений файл порожній."
+    zero_resp = await words_client.post(
+        "/api/words/import",
+        headers=headers,
+        files={"file": ("empty.xlsx", b"", XLSX_MIME)},
+    )
+    assert zero_resp.status_code == 422
+    assert zero_resp.json()["detail"] == "Завантажений файл порожній."
+
+    # 2. Simultaneous `text` and `file` (.xlsx) -> 422
+    both_resp = await words_client.post(
+        "/api/words/import",
+        headers=headers,
+        data={"text": "der Zug - потяг"},
+        files={"file": ("words.xlsx", valid_xlsx, XLSX_MIME)},
+    )
+    assert both_resp.status_code == 422
+
+    # 3. Legacy .xls (and .XLS) -> 400 with Ukrainian guidance (.xlsx, .csv, .txt)
+    for legacy_name in ("legacy.xls", "LEGACY.XLS"):
+        xls_resp = await words_client.post(
+            "/api/words/import",
+            headers=headers,
+            files={
+                "file": (
+                    legacy_name,
+                    b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 32,
+                    "application/vnd.ms-excel",
+                ),
+            },
+        )
+        assert xls_resp.status_code == 400
+        detail = xls_resp.json()["detail"]
+        assert ".xls" in detail
+        assert ".xlsx" in detail
+        assert ".csv" in detail
+        assert ".txt" in detail
+
+    # 4. Other unsupported extensions (.pdf, .docx) -> 400 listing .txt, .csv, .xlsx
+    for bad_name, bad_bytes in (
+        ("file.pdf", b"%PDF-1.7\x00binary"),
+        ("file.docx", b"PK\x03\x04not-xlsx"),
+    ):
+        ext_resp = await words_client.post(
+            "/api/words/import",
+            headers=headers,
+            files={"file": (bad_name, bad_bytes, "application/octet-stream")},
+        )
+        assert ext_resp.status_code == 400
+        detail = ext_resp.json()["detail"]
+        assert ".txt" in detail
+        assert ".csv" in detail
+        assert ".xlsx" in detail
+
+    # 5. Corrupted / random / renamed .txt / renamed .xls / broken XML with .xlsx extension -> 400
+    corrupted_xml_buf = io.BytesIO()
+    with (
+        zipfile.ZipFile(io.BytesIO(valid_xlsx), mode="r") as src,
+        zipfile.ZipFile(corrupted_xml_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as dst,
+    ):
+        for item in src.infolist():
+            if item.filename == "xl/worksheets/sheet1.xml":
+                dst.writestr(item, b"<worksheet><broken")
+            else:
+                dst.writestr(item, src.read(item.filename))
+
+    for bad_xlsx_bytes in (
+        b"\x00\xff\xfe\x13random-bytes",
+        "der Zug - потяг\n".encode(),
+        b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64,
+        corrupted_xml_buf.getvalue(),
+    ):
+        bad_resp = await words_client.post(
+            "/api/words/import",
+            headers=headers,
+            files={"file": ("broken.xlsx", bad_xlsx_bytes, XLSX_MIME)},
+        )
+        assert bad_resp.status_code == 400
+        assert bad_resp.json()["detail"]
+
+    # 6. ZIP bomb (> 20 MiB uncompressed) & > 512 ZIP entries -> 400 (never 500)
+    bomb_buf = io.BytesIO()
+    with zipfile.ZipFile(bomb_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("xl/worksheets/sheet1.xml", b"0" * (MAX_XLSX_UNCOMPRESSED_BYTES + 1024))
+    bomb_resp = await words_client.post(
+        "/api/words/import",
+        headers=headers,
+        files={"file": ("bomb.xlsx", bomb_buf.getvalue(), XLSX_MIME)},
+    )
+    assert bomb_resp.status_code == 400
+    assert bomb_resp.json()["detail"]
+
+    many_buf = io.BytesIO()
+    with zipfile.ZipFile(many_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for idx in range(MAX_XLSX_ZIP_ENTRIES + 1):
+            zf.writestr(f"e{idx}.xml", b"<a/>")
+    many_resp = await words_client.post(
+        "/api/words/import",
+        headers=headers,
+        files={"file": ("many.xlsx", many_buf.getvalue(), XLSX_MIME)},
+    )
+    assert many_resp.status_code == 400
+    assert many_resp.json()["detail"]
+
+    # 7. Raw .xlsx exceeding 2 MiB -> 413 with Ukrainian detail
+    oversized_xlsx = b"PK\x03\x04" + b"0" * MAX_IMPORT_BYTES
+    big_resp = await words_client.post(
+        "/api/words/import",
+        headers=headers,
+        files={"file": ("huge.xlsx", oversized_xlsx, XLSX_MIME)},
+    )
+    assert big_resp.status_code == 413
+    assert "2 МБ" in big_resp.json()["detail"]
+
+    # Nothing persisted to DB
+    assert (await words_client.get("/api/words", headers=headers)).json() == {
+        "items": [],
+        "total": 0,
+    }
+
+
+async def test_import_xlsx_enforces_401_auth_and_strict_user_id_isolation(
+    words_client: AsyncClient,
+) -> None:
+    xlsx_a = _make_xlsx_bytes([("Sheet1", [["der Zug", "потяг"], ["das Buch", "книга"]])])
+    xlsx_b = _make_xlsx_bytes([("Sheet1", [["die Katze", "кішка"]])])
+
+    # Unauthenticated .xlsx upload -> 401
+    unauth_resp = await words_client.post(
+        "/api/words/import",
+        files={"file": ("words.xlsx", xlsx_a, XLSX_MIME)},
+    )
+    assert unauth_resp.status_code == 401
+
+    # Invalid API key .xlsx upload -> 401
+    bad_auth_resp = await words_client.post(
+        "/api/words/import",
+        headers=build_bot_headers(USER_A_ID, api_key="wrong-key"),
+        files={"file": ("words.xlsx", xlsx_a, XLSX_MIME)},
+    )
+    assert bad_auth_resp.status_code == 401
+
+    # User A imports via TMA auth; User B imports via Bot auth -> strictly isolated
+    headers_a = build_tma_headers(USER_A_ID)
+    headers_b = build_bot_headers(USER_B_ID)
+
+    resp_a = await words_client.post(
+        "/api/words/import",
+        headers=headers_a,
+        files={"file": ("a.xlsx", xlsx_a, XLSX_MIME)},
+    )
+    assert resp_a.status_code == 200
+    assert resp_a.json() == {"imported": 2, "duplicates": 0, "skipped": 0}
+
+    # User B still has 0 words before importing
+    assert (await words_client.get("/api/words", headers=headers_b)).json()["total"] == 0
+
+    resp_b = await words_client.post(
+        "/api/words/import",
+        headers=headers_b,
+        files={"file": ("b.xlsx", xlsx_b, XLSX_MIME)},
+    )
+    assert resp_b.status_code == 200
+    assert resp_b.json() == {"imported": 1, "duplicates": 0, "skipped": 0}
+
+    words_a = (await words_client.get("/api/words", headers=headers_a)).json()
+    words_b = (await words_client.get("/api/words", headers=headers_b)).json()
+    assert {w["word_de"] for w in words_a["items"]} == {"der Zug", "das Buch"}
+    assert {w["word_de"] for w in words_b["items"]} == {"die Katze"}

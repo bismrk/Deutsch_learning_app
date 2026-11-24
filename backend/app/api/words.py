@@ -29,9 +29,11 @@ from app.core.sheets_sync import (
     SheetsSyncError,
     SheetsTimeoutError,
     SheetsUpstreamError,
+    XlsxParseError,
     decode_utf8_bytes,
     normalize_word_key,
     parse_vocabulary_text,
+    parse_xlsx_bytes,
     sync_google_sheet,
 )
 from app.db.base import get_db
@@ -47,7 +49,9 @@ from app.schemas.words import (
 
 router = APIRouter(prefix="/words", tags=["words"])
 
-_ALLOWED_UPLOAD_EXTENSIONS = frozenset({".txt", ".csv"})
+_ALLOWED_UPLOAD_EXTENSIONS = frozenset({".txt", ".csv", ".xlsx"})
+_XLSX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+_XLS_MIME_TYPE = "application/vnd.ms-excel"
 _UPLOAD_CHUNK_SIZE = 64 * 1024  # 64 KiB
 _INSERT_BATCH_SIZE = 1000
 _PG_INT32_MAX = 2_147_483_647
@@ -70,7 +74,10 @@ def _raise_http_for_sync_error(exc: SheetsSyncError) -> NoReturn:
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=str(exc),
         ) from exc
-    if isinstance(exc, (InvalidSheetsUrlError, SheetsAccessError, InvalidImportEncodingError)):
+    if isinstance(
+        exc,
+        (InvalidSheetsUrlError, SheetsAccessError, InvalidImportEncodingError, XlsxParseError),
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
@@ -215,9 +222,9 @@ async def _read_request_body_bounded(
     return bytes(buffer)
 
 
-async def _extract_import_source(
+async def _extract_and_parse_import(
     request: Request,
-) -> tuple[str, ParseFormatHint, Literal["text", "file"]]:
+) -> tuple[ParseResult, Literal["text", "file"]]:
     content_type = (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
 
     if content_type == "application/json":
@@ -225,7 +232,7 @@ async def _extract_import_source(
         if not raw_body.strip():
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail="Передайте текст або файл (.txt / .csv) для імпорту.",
+                detail="Передайте текст або файл (.txt / .csv / .xlsx) для імпорту.",
             )
         try:
             decoded_body = json.loads(raw_body.decode("utf-8"))
@@ -248,7 +255,7 @@ async def _extract_import_source(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Текст для імпорту не може бути порожнім.",
             )
-        return parsed_json.text, "text", "text"
+        return parse_vocabulary_text(parsed_json.text, format_hint="text"), "text"
 
     if content_type in {"multipart/form-data", "application/x-www-form-urlencoded"}:
         # URL-encoded UTF-8 expands up to 3x (%XX per byte); multipart text parts are raw UTF-8.
@@ -297,32 +304,49 @@ async def _extract_import_source(
                     status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="Завантажений файл порожній.",
                 )
-            decoded_text = decode_utf8_bytes(raw_bytes)
             suffix = FilePath(upload.filename or "").suffix.lower()
+            upload_content_type = (
+                (upload.content_type or "").split(";", 1)[0].strip().lower()
+            )
+            if suffix == ".xls" or (not suffix and upload_content_type == _XLS_MIME_TYPE):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        "Застарілий формат Excel (.xls) не підтримується. "
+                        "Збережіть таблицю як .xlsx, .csv або .txt."
+                    ),
+                )
             if suffix and suffix not in _ALLOWED_UPLOAD_EXTENSIONS:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Підтримуються лише текстові файли форматів .txt та .csv.",
+                    detail=(
+                        "Непідтримуваний формат файлу. "
+                        "Підтримуються лише файли форматів .txt, .csv та .xlsx."
+                    ),
                 )
+            if suffix == ".xlsx" or (not suffix and upload_content_type == _XLSX_MIME_TYPE):
+                return parse_xlsx_bytes(raw_bytes), "file"
+
+            decoded_text = decode_utf8_bytes(raw_bytes)
             if not decoded_text.strip():
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="Завантажений файл порожній.",
                 )
             format_hint: ParseFormatHint = "csv" if suffix == ".csv" else "text"
-            return decoded_text, format_hint, "file"
+            return parse_vocabulary_text(decoded_text, format_hint=format_hint), "file"
 
         if text_value is not None:
-            return text_value, "text", "text"
+            return parse_vocabulary_text(text_value, format_hint="text"), "text"
 
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="Передайте текст або файл (.txt / .csv) для імпорту.",
+            detail="Передайте текст або файл (.txt / .csv / .xlsx) для імпорту.",
         )
 
     raise HTTPException(
         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-        detail="Передайте текст або файл (.txt / .csv) для імпорту.",
+        detail="Передайте текст або файл (.txt / .csv / .xlsx) для імпорту.",
     )
 
 
@@ -422,14 +446,13 @@ async def import_words(
     db: Annotated[AsyncSession, Depends(get_db)],
     now: Annotated[datetime, Depends(get_utc_now)],
 ) -> WordImportResponse:
-    """Import vocabulary words from JSON text, form text, or an uploaded ``.txt``/``.csv`` file."""
+    """Import vocabulary words from JSON/form text or an uploaded ``.txt``/``.csv``/``.xlsx``."""
     _, changed = await ensure_user_initialized(db, user_id)
     if changed:
         await db.commit()
 
     try:
-        raw_text, format_hint, source = await _extract_import_source(request)
-        parse_result = parse_vocabulary_text(raw_text, format_hint=format_hint)
+        parse_result, source = await _extract_and_parse_import(request)
     except SheetsSyncError as exc:
         _raise_http_for_sync_error(exc)
 
