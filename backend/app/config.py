@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     db_healthcheck_timeout: float = Field(default=2.0, gt=0.0, le=3.0)
     bot_token: str | None = None
     internal_api_key: str | None = None
+    init_data_max_age_seconds: int = Field(default=86400, ge=1)
 
     llm_base_url: str = Field(default="https://api.deepseek.com", min_length=1)
     llm_api_key: str | None = None
