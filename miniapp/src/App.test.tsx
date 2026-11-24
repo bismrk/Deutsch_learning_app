@@ -1,4 +1,11 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import type { ChartData, ChartOptions } from "chart.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -35,6 +42,37 @@ const SAMPLE_RADAR_STATS = {
   weak_topics: [],
 };
 
+const SAMPLE_WORDS_LIST = {
+  items: [
+    {
+      id: 10,
+      word_de: "der Bahnhof",
+      translation_ua: "вокзал",
+      part_of_speech: "noun",
+      source: "text",
+      state: 0,
+      stability: 0,
+      difficulty: 0,
+      due_at: "2026-11-24T10:00:00Z",
+      reps: 0,
+      lapses: 0,
+    },
+  ],
+  total: 1,
+};
+
+const SAMPLE_PROFILE = {
+  telegram_id: 77,
+  level: "A1",
+  exercises_per_set: 5,
+  theme: "light",
+  sheets_url: null,
+  reminder_hour: 19,
+  timezone: "Europe/Kyiv",
+  daily_llm_calls: 0,
+  created_at: "2026-11-24T10:00:00Z",
+};
+
 function makeJsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -59,11 +97,17 @@ describe("App", () => {
     delete document.documentElement.dataset.theme;
   });
 
-  it("renders StatsPage and lets user switch themes locally outside Telegram without calling profile endpoints", async () => {
+  it("switches across all 3 tabs (Статистика, Словник, Налаштування) and sets aria-current='page'", async () => {
     const fetchMock = vi.fn<typeof fetch>(async (input) => {
       const url = String(input);
       if (url === "/api/stats/radar") {
         return makeJsonResponse(SAMPLE_RADAR_STATS);
+      }
+      if (url === "/api/words") {
+        return makeJsonResponse(SAMPLE_WORDS_LIST);
+      }
+      if (url === "/api/users/me") {
+        return makeJsonResponse(SAMPLE_PROFILE);
       }
       throw new Error(`Unexpected fetch URL: ${url}`);
     });
@@ -71,26 +115,60 @@ describe("App", () => {
 
     render(<App />);
 
-    expect(screen.getByRole("heading", { name: "Тренажер німецької" })).toBeTruthy();
+    expect(
+      screen.getByRole("heading", { name: "Тренажер німецької" }),
+    ).toBeTruthy();
+
+    const nav = screen.getByRole("navigation", { name: "Основна навігація" });
+    const statsTab = within(nav).getByRole("button", { name: "Статистика" });
+    const dictionaryTab = within(nav).getByRole("button", { name: "Словник" });
+    const settingsTab = within(nav).getByRole("button", {
+      name: "Налаштування",
+    });
+
+    // Starts on Статистика
+    expect(statsTab.getAttribute("aria-current")).toBe("page");
+    expect(dictionaryTab.getAttribute("aria-current")).toBeNull();
+    expect(settingsTab.getAttribute("aria-current")).toBeNull();
 
     await waitFor(() => {
       expect(screen.getByTestId("radar-canvas")).toBeTruthy();
     });
 
-    const calledUrls = fetchMock.mock.calls.map(([url]) => String(url));
-    expect(calledUrls).toEqual(["/api/stats/radar"]);
+    // Switch to Словник
+    fireEvent.click(dictionaryTab);
+    expect(statsTab.getAttribute("aria-current")).toBeNull();
+    expect(dictionaryTab.getAttribute("aria-current")).toBe("page");
+    expect(settingsTab.getAttribute("aria-current")).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: "Темна" }));
-    expect(document.documentElement.dataset.theme).toBe("dark");
-    expect(
-      screen.getByText("Тему збережено локально на цьому пристрої."),
-    ).toBeTruthy();
-    expect(capturedRadarProps.calls.at(-1)?.data.datasets[0]?.borderColor).toBe(
-      "#3B82F6",
-    );
+    await waitFor(() => {
+      expect(screen.getByText("der Bahnhof")).toBeTruthy();
+    });
+    expect(screen.queryByTestId("radar-canvas")).toBeNull();
+
+    // Switch to Налаштування
+    fireEvent.click(settingsTab);
+    expect(statsTab.getAttribute("aria-current")).toBeNull();
+    expect(dictionaryTab.getAttribute("aria-current")).toBeNull();
+    expect(settingsTab.getAttribute("aria-current")).toBe("page");
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("heading", { name: "Параметри навчання та нагадувань" }),
+      ).toBeTruthy();
+    });
+    expect(screen.queryByText("der Bahnhof")).toBeNull();
+
+    // Switch back to Статистика
+    fireEvent.click(statsTab);
+    expect(statsTab.getAttribute("aria-current")).toBe("page");
+
+    await waitFor(() => {
+      expect(screen.getByTestId("radar-canvas")).toBeTruthy();
+    });
   });
 
-  it("syncs theme changes with PATCH /api/users/settings and updates RadarChart when opened inside Telegram", async () => {
+  it("syncs theme from Settings tab via PATCH /api/users/settings and updates RadarChart palette", async () => {
     window.Telegram = {
       WebApp: {
         initData: "user=%7B%22id%22%3A77%7D&auth_date=1700000000&hash=abc",
@@ -104,36 +182,21 @@ describe("App", () => {
       },
     };
 
+    let savedTheme = "light";
     const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
       const url = String(input);
       if (url === "/api/users/me") {
-        return makeJsonResponse({
-          telegram_id: 77,
-          level: "A1",
-          exercises_per_set: 5,
-          theme: "light",
-          sheets_url: null,
-          reminder_hour: 19,
-          timezone: "Europe/Kyiv",
-          daily_llm_calls: 0,
-          created_at: "2026-11-24T10:00:00Z",
-        });
+        return makeJsonResponse({ ...SAMPLE_PROFILE, theme: savedTheme });
       }
       if (url === "/api/stats/radar") {
         return makeJsonResponse(SAMPLE_RADAR_STATS);
       }
       if (url === "/api/users/settings" && init?.method === "PATCH") {
-        return makeJsonResponse({
-          telegram_id: 77,
-          level: "A1",
-          exercises_per_set: 5,
-          theme: "dark",
-          sheets_url: null,
-          reminder_hour: 19,
-          timezone: "Europe/Kyiv",
-          daily_llm_calls: 0,
-          created_at: "2026-11-24T10:00:00Z",
-        });
+        const body = JSON.parse(String(init.body)) as { theme?: string };
+        if (body.theme) {
+          savedTheme = body.theme;
+        }
+        return makeJsonResponse({ ...SAMPLE_PROFILE, theme: savedTheme });
       }
       throw new Error(`Unexpected fetch: ${url}`);
     });
@@ -148,38 +211,37 @@ describe("App", () => {
       "#2563EB",
     );
 
+    const nav = screen.getByRole("navigation", { name: "Основна навігація" });
+    fireEvent.click(within(nav).getByRole("button", { name: "Налаштування" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Темна" })).toBeTruthy();
+    });
+
     fireEvent.click(screen.getByRole("button", { name: "Темна" }));
 
     await waitFor(() => {
-      expect(screen.getByText("Тему синхронізовано з профілем.")).toBeTruthy();
+      expect(screen.getByText("Тему оформлення збережено.")).toBeTruthy();
     });
-
     expect(document.documentElement.dataset.theme).toBe("dark");
-    expect(capturedRadarProps.calls.at(-1)?.data.datasets[0]?.borderColor).toBe(
-      "#3B82F6",
-    );
 
     const patchCall = fetchMock.mock.calls.find(
       ([url, init]) => url === "/api/users/settings" && init?.method === "PATCH",
     );
-    expect(patchCall).toBeDefined();
     expect(patchCall?.[1]?.body).toBe(JSON.stringify({ theme: "dark" }));
+
+    // Return to Stats -> RadarChart renders with dark theme palette
+    fireEvent.click(within(nav).getByRole("button", { name: "Статистика" }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("radar-canvas")).toBeTruthy();
+    });
+    expect(capturedRadarProps.calls.at(-1)?.data.datasets[0]?.borderColor).toBe(
+      "#3B82F6",
+    );
   });
 
-  it("keeps local theme applied and shows StatsPage error state without crashing when backend fails", async () => {
-    window.Telegram = {
-      WebApp: {
-        initData: "user=%7B%22id%22%3A77%7D&auth_date=1700000000&hash=abc",
-        colorScheme: "dark",
-        ready: vi.fn(),
-        expand: vi.fn(),
-        setHeaderColor: vi.fn(),
-        setBackgroundColor: vi.fn(),
-        onEvent: vi.fn(),
-        offEvent: vi.fn(),
-      },
-    };
-
+  it("handles backend failures gracefully across tabs without crashing", async () => {
     const fetchMock = vi
       .fn<typeof fetch>()
       .mockRejectedValue(new TypeError("Network down"));
@@ -187,13 +249,20 @@ describe("App", () => {
 
     render(<App />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Світла" }));
-
-    expect(document.documentElement.dataset.theme).toBe("light");
     await waitFor(() => {
-      expect(screen.getByRole("status").textContent).toMatch(
-        /Тему застосовано локально/,
-      );
+      expect(screen.getByRole("alert")).toBeTruthy();
+    });
+
+    const nav = screen.getByRole("navigation", { name: "Основна навігація" });
+    fireEvent.click(within(nav).getByRole("button", { name: "Словник" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toBeTruthy();
+    });
+
+    fireEvent.click(within(nav).getByRole("button", { name: "Налаштування" }));
+
+    await waitFor(() => {
       expect(screen.getByRole("alert")).toBeTruthy();
     });
   });
