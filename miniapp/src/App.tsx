@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { apiClient, ApiError } from "./api/client";
+import { StatsPage } from "./pages/StatsPage";
 import { getTelegramInitData } from "./telegram";
 import { ThemeProvider, useTheme, type ThemeMode } from "./theme/ThemeProvider";
 
@@ -82,6 +83,8 @@ function AppShell() {
           Особистий кабінет для відстеження прогресу та словника
         </p>
       </header>
+
+      <StatsPage />
 
       <section className="surface-card" aria-labelledby="theme-section-title">
         <h2 id="theme-section-title" className="card-title">

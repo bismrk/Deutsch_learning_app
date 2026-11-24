@@ -152,3 +152,230 @@ select:focus-visible {
   font-size: 0.8125rem;
   color: var(--text-secondary);
 }
+
+.stats-page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.stats-section-header {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.radar-chart-container {
+  position: relative;
+  width: 100%;
+  height: 290px;
+}
+
+.axes-grid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.axis-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 12px;
+  background-color: var(--bg-primary);
+  border: 1px solid var(--border-subtle);
+}
+
+.axis-card--coming-soon {
+  opacity: 0.72;
+}
+
+.axis-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.axis-name {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.axis-card--coming-soon .axis-name {
+  color: var(--text-secondary);
+}
+
+.coming-soon-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  background-color: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.axis-score-row {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.axis-score {
+  font-size: 1.375rem;
+  font-weight: 700;
+  line-height: 1.1;
+  color: var(--text-primary);
+}
+
+.axis-card--coming-soon .axis-score {
+  color: var(--text-secondary);
+}
+
+.axis-score-max {
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+}
+
+.axis-progress-track {
+  width: 100%;
+  height: 6px;
+  border-radius: 999px;
+  background-color: var(--border-subtle);
+  overflow: hidden;
+}
+
+.axis-progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background-color: var(--accent);
+  transition: width 180ms ease;
+}
+
+.weak-topics-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.weak-topic-item {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 12px;
+  background-color: var(--bg-primary);
+  border: 1px solid var(--border-subtle);
+}
+
+.weak-topic-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.weak-topic-name {
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.weak-topic-meta {
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+}
+
+.youtube-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  align-self: flex-start;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--accent);
+  background-color: var(--accent-fill);
+  color: var(--text-primary);
+  font-size: 0.875rem;
+  font-weight: 600;
+  text-decoration: none;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+.retry-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  align-self: flex-start;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 10px 16px;
+  border-radius: 12px;
+  border: 1px solid var(--accent);
+  background-color: var(--accent);
+  color: #FFFFFF;
+  font-size: 0.9375rem;
+  font-weight: 600;
+}
+
+.stats-skeleton {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  padding-top: 4px;
+}
+
+.skeleton-circle {
+  width: 210px;
+  height: 210px;
+  border-radius: 50%;
+  border: 1px solid var(--border-subtle);
+  background-color: var(--bg-primary);
+  animation: stats-pulse 1.4s ease-in-out infinite;
+}
+
+.skeleton-grid {
+  width: 100%;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.skeleton-card {
+  height: 76px;
+  border-radius: 12px;
+  border: 1px solid var(--border-subtle);
+  background-color: var(--bg-primary);
+  animation: stats-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes stats-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-circle,
+  .skeleton-card {
+    animation: none;
+  }
+}
