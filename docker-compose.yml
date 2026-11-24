@@ -68,6 +68,25 @@ services:
       postgres:
         condition: service_healthy
 
+  bot:
+    build:
+      context: ./bot
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      APP_ENV:
+      LOG_LEVEL:
+      BOT_TOKEN:
+      INTERNAL_API_KEY:
+      BACKEND_API_URL: ${BACKEND_API_URL:-http://backend:8000}
+      MINIAPP_URL:
+    depends_on:
+      backend:
+        condition: service_healthy
+
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped

@@ -1,0 +1,31 @@
+[project]
+name = "deutsch-learning-bot"
+version = "0.1.0"
+description = "Standalone aiogram 3 Telegram bot client for the Deutsch Learning API"
+requires-python = ">=3.12"
+dependencies = [
+    "aiogram>=3.17.0,<4.0.0",
+    "httpx>=0.28.0",
+    "pydantic-settings>=2.6.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "respx>=0.22.0",
+    "ruff>=0.8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
