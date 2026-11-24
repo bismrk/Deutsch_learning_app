@@ -6,6 +6,7 @@ from typing import Final, cast
 
 from aiogram import F, Router
 from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InaccessibleMessage, Message
 
 from bot_app.api_client import BackendAPIClient, BackendAPIError
@@ -50,10 +51,14 @@ async def handle_start(
     message: Message,
     api_client: BackendAPIClient,
     settings: BotSettings,
+    state: FSMContext | None = None,
 ) -> None:
-    """Auto-initialize the user via Backend API, show main menu, and offer level selection."""
+    """Auto-initialize the user via Backend API, clear FSM state, and offer level selection."""
     if message.from_user is None:
         return
+
+    if state is not None:
+        await state.clear()
 
     try:
         profile = await api_client.get_me(message.from_user.id)
