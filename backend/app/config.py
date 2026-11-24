@@ -31,7 +31,15 @@ class Settings(BaseSettings):
     llm_base_url: str = Field(default="https://api.deepseek.com", min_length=1)
     llm_api_key: str | None = None
     llm_model: str = Field(default="deepseek-chat", min_length=1)
+    llm_timeout_seconds: float = Field(default=20.0, gt=0.0, allow_inf_nan=False)
     daily_llm_limit: int = Field(default=50, ge=1)
+
+    @field_validator("llm_base_url", "llm_model", mode="before")
+    @classmethod
+    def strip_llm_strings(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip()
+        return value
 
     @field_validator("app_env", mode="before")
     @classmethod
