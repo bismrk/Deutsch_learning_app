@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="uk">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Тренажер німецької</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script>
+      (function () {
+        var STORAGE_KEY = "deutsch_miniapp_theme";
+        var saved = "system";
+        try {
+          var raw = window.localStorage.getItem(STORAGE_KEY);
+          if (raw === "dark" || raw === "light" || raw === "system") {
+            saved = raw;
+          }
+        } catch (_err) {
+          saved = "system";
+        }
+
+        var resolved = saved;
+        if (resolved === "system") {
+          var tgScheme =
+            window.Telegram &&
+            window.Telegram.WebApp &&
+            window.Telegram.WebApp.colorScheme;
+          if (tgScheme === "dark" || tgScheme === "light") {
+            resolved = tgScheme;
+          } else if (
+            typeof window.matchMedia === "function" &&
+            window.matchMedia("(prefers-color-scheme: dark)").matches
+          ) {
+            resolved = "dark";
+          } else {
+            resolved = "light";
+          }
+        }
+
+        document.documentElement.dataset.theme = resolved;
+
+        var bgColor = resolved === "dark" ? "#000000" : "#FFFFFF";
+        try {
+          var webApp = window.Telegram && window.Telegram.WebApp;
+          if (webApp) {
+            if (typeof webApp.setHeaderColor === "function") {
+              webApp.setHeaderColor(bgColor);
+            }
+            if (typeof webApp.setBackgroundColor === "function") {
+              webApp.setBackgroundColor(bgColor);
+            }
+          }
+        } catch (_err) {
+          // Ignore Telegram WebApp API errors in unsupported environments.
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

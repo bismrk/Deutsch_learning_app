@@ -19,6 +19,11 @@ build/
 .coverage
 htmlcov/
 
+# Node / Mini App
+node_modules/
+miniapp/node_modules/
+miniapp/dist/
+
 # OS files
 .DS_Store
 Thumbs.db
