@@ -109,10 +109,13 @@ def _parse_int_in_range(raw: str, *, min_value: int, max_value: int) -> int | No
     cleaned = raw.strip()
     if not cleaned:
         return None
-    # Reject signs/spaces other than plain digits (including negative numbers).
-    if not cleaned.isdigit():
+    # Require strictly ASCII digits (reject signs, whitespace, and Unicode superscripts like "²").
+    if not (cleaned.isascii() and cleaned.isdigit()):
         return None
-    value = int(cleaned)
+    try:
+        value = int(cleaned)
+    except ValueError:
+        return None
     if min_value <= value <= max_value:
         return value
     return None

@@ -700,3 +700,75 @@ async def test_settings_custom_timezone_422_end_to_end_with_api_client() -> None
     assert route.called
     assert await state.get_state() == SettingsStates.waiting_timezone.state
     assert msg.answer.await_args.args[0] == SETTINGS_INVALID_TIMEZONE_UA
+
+
+@pytest.mark.parametrize("unicode_digit", ["²", "³", "¹", "⁰", "₂", "9" * 5000])
+async def test_settings_unicode_superscript_and_huge_digits_rejected_safely(
+    unicode_digit: str,
+) -> None:
+    api_client = _make_api_mock()
+
+    # 1. Custom exercises_per_set text input
+    _, state_ex = _make_fsm()
+    await state_ex.set_state(SettingsStates.waiting_exercises_per_set)
+    ex_msg = _make_message(unicode_digit)
+    await handle_settings_exercises_text_input(
+        message=ex_msg,
+        state=state_ex,
+        api_client=api_client,
+    )
+    assert await state_ex.get_state() == SettingsStates.waiting_exercises_per_set.state
+    assert ex_msg.answer.await_args.args[0] == SETTINGS_INVALID_EXERCISES_UA
+
+    # 2. Custom reminder_hour text input
+    _, state_rem = _make_fsm()
+    await state_rem.set_state(SettingsStates.waiting_reminder_hour)
+    rem_msg = _make_message(unicode_digit)
+    await handle_settings_reminder_text_input(
+        message=rem_msg,
+        state=state_rem,
+        api_client=api_client,
+    )
+    assert await state_rem.get_state() == SettingsStates.waiting_reminder_hour.state
+    assert rem_msg.answer.await_args.args[0] == SETTINGS_INVALID_REMINDER_UA
+
+    # 3. Malformed callback data must never raise and must still call callback.answer()
+    ex_cb = _make_callback(f"{SETTINGS_EXERCISES_CALLBACK_PREFIX}{unicode_digit}")
+    await handle_settings_exercises_select(callback=ex_cb, api_client=api_client)
+    ex_cb.answer.assert_awaited_once()
+
+    rem_cb = _make_callback(f"{SETTINGS_REMINDER_CALLBACK_PREFIX}{unicode_digit}")
+    await handle_settings_reminder_select(callback=rem_cb, api_client=api_client)
+    rem_cb.answer.assert_awaited_once()
+
+    api_client.update_settings.assert_not_awaited()
+
+
+async def test_dispatcher_unicode_superscript_in_waiting_exercises_is_rejected() -> None:
+    api_client = _make_api_mock()
+    dispatcher = create_dispatcher(api_client=api_client, settings=_make_settings())
+    key = StorageKey(bot_id=BOT_ID, chat_id=CHAT_ID, user_id=USER_ID)
+    await dispatcher.storage.set_state(key, SettingsStates.waiting_exercises_per_set)
+
+    bot = MagicMock()
+    bot.id = BOT_ID
+    sent_payloads: list[object] = []
+
+    async def _capture(method: object, request_timeout: int | None = None) -> None:
+        sent_payloads.append(method)
+
+    bot.side_effect = _capture
+
+    msg = Message(
+        message_id=40,
+        date=datetime(2026, 11, 24, 12, 20, tzinfo=UTC),
+        chat=Chat(id=CHAT_ID, type="private"),
+        from_user=User(id=USER_ID, is_bot=False, first_name="Tester"),
+        text="²",
+    )
+    await dispatcher.feed_update(bot, Update(update_id=20, message=msg))
+
+    api_client.update_settings.assert_not_awaited()
+    assert await dispatcher.storage.get_state(key) == SettingsStates.waiting_exercises_per_set.state
+    assert len(sent_payloads) == 1
+    assert getattr(sent_payloads[0], "text", "") == SETTINGS_INVALID_EXERCISES_UA
