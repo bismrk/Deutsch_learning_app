@@ -1,5 +1,21 @@
 """Pydantic request and response schemas for Backend API endpoints."""
 
+from app.schemas.exercises import (
+    CEFR_LEVELS,
+    EXERCISE_TYPES,
+    FILL_BLANK_MARKER,
+    MAX_FSRS_RATING,
+    MAX_GRAMMAR_SCORE,
+    MIN_FSRS_RATING,
+    MIN_GRAMMAR_SCORE,
+    ExerciseError,
+    ExerciseEvaluation,
+    ExercisePublic,
+    ExerciseType,
+    GeneratedExercise,
+    TargetWord,
+    WordRating,
+)
 from app.schemas.users import (
     UserLevel,
     UserProfileResponse,
@@ -18,7 +34,20 @@ from app.schemas.words import (
 )
 
 __all__ = [
+    "CEFR_LEVELS",
+    "EXERCISE_TYPES",
+    "FILL_BLANK_MARKER",
+    "MAX_FSRS_RATING",
+    "MAX_GRAMMAR_SCORE",
+    "MIN_FSRS_RATING",
+    "MIN_GRAMMAR_SCORE",
+    "ExerciseError",
+    "ExerciseEvaluation",
+    "ExercisePublic",
+    "ExerciseType",
+    "GeneratedExercise",
     "SheetsSyncRequest",
+    "TargetWord",
     "UserLevel",
     "UserProfileResponse",
     "UserSettingsUpdate",
@@ -27,6 +56,7 @@ __all__ = [
     "WordImportResponse",
     "WordItemResponse",
     "WordListResponse",
+    "WordRating",
     "WordSource",
     "validate_iana_timezone",
     "validate_sheets_url",
