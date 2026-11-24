@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, Router
 
 from bot_app.api_client import BackendAPIClient
 from bot_app.config import BotSettings, get_settings
-from bot_app.handlers import start_router
+from bot_app.handlers import start_router, training_router
 
 logger = logging.getLogger(__name__)
 
@@ -29,12 +29,20 @@ def create_bot(settings: BotSettings) -> Bot:
     return Bot(token=settings.bot_token)
 
 
+def _attach_router(dispatcher: Dispatcher, router: Router) -> None:
+    """Attach a module-level router, detaching any prior parent dispatcher cleanly."""
+    if router.parent_router is not None:
+        router._parent_router = None
+    dispatcher.include_router(router)
+
+
 def create_dispatcher(api_client: BackendAPIClient, settings: BotSettings) -> Dispatcher:
     """Create the ``aiogram.Dispatcher`` with shared dependencies and routers."""
     dispatcher = Dispatcher()
     dispatcher["api_client"] = api_client
     dispatcher["settings"] = settings
-    dispatcher.include_router(start_router)
+    _attach_router(dispatcher, start_router)
+    _attach_router(dispatcher, training_router)
     return dispatcher
 
 
