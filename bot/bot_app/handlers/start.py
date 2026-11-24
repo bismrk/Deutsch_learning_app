@@ -11,10 +11,13 @@ from aiogram.types import CallbackQuery, InaccessibleMessage, Message
 
 from bot_app.api_client import BackendAPIClient, BackendAPIError
 from bot_app.config import BotSettings
+from bot_app.handlers.training import TrainingStates
 from bot_app.keyboards import (
     LEVEL_CALLBACK_PREFIX,
+    MENU_BTN_MINIAPP,
     build_level_keyboard,
     build_main_menu_keyboard,
+    build_miniapp_inline_keyboard,
 )
 from bot_app.schemas import VALID_USER_LEVELS, UserLevel, UserProfile
 
@@ -25,6 +28,12 @@ LEVEL_PROMPT_TEXT_UA: Final = (
 )
 UNKNOWN_LEVEL_MESSAGE_UA: Final = (
     "Невідомий рівень. Обери один із варіантів: A1, A2 або B1."
+)
+MINIAPP_OPEN_TEXT_UA: Final = (
+    "Натисни кнопку нижче, щоб відкрити свою статистику та прогрес у Mini App:"
+)
+MINIAPP_UNAVAILABLE_TEXT_UA: Final = (
+    "Mini App зі статистикою наразі не налаштовано. Спробуй пізніше або скористайся командами бота."
 )
 
 
@@ -118,12 +127,41 @@ async def handle_level_selection(
         )
 
 
+@router.message(F.text == MENU_BTN_MINIAPP)
+async def handle_miniapp_menu(
+    message: Message,
+    settings: BotSettings,
+    state: FSMContext | None = None,
+) -> None:
+    """Send an inline Mini App button with signed initData, preserving active exercise answers."""
+    if message.from_user is None:
+        return
+
+    if state is not None:
+        current_state = await state.get_state()
+        if current_state is not None and current_state != TrainingStates.waiting_answer.state:
+            await state.clear()
+
+    inline_keyboard = build_miniapp_inline_keyboard(settings.miniapp_url)
+    if inline_keyboard is None:
+        await message.answer(MINIAPP_UNAVAILABLE_TEXT_UA)
+        return
+
+    await message.answer(
+        MINIAPP_OPEN_TEXT_UA,
+        reply_markup=inline_keyboard,
+    )
+
+
 __all__ = [
     "LEVEL_PROMPT_TEXT_UA",
+    "MINIAPP_OPEN_TEXT_UA",
+    "MINIAPP_UNAVAILABLE_TEXT_UA",
     "UNKNOWN_LEVEL_MESSAGE_UA",
     "build_level_updated_text",
     "build_welcome_text",
     "handle_level_selection",
+    "handle_miniapp_menu",
     "handle_start",
     "router",
 ]

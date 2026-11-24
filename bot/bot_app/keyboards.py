@@ -31,6 +31,7 @@ MENU_BTN_TRAINING: Final = "🎯 Тренування"
 MENU_BTN_VOCABULARY: Final = "📚 Словник"
 MENU_BTN_SETTINGS: Final = "⚙️ Налаштування"
 MENU_BTN_MINIAPP: Final = "📊 Статистика"
+MINIAPP_OPEN_BTN: Final = "📊 Відкрити статистику"
 
 MAIN_MENU_BUTTONS: Final[frozenset[str]] = frozenset(
     {
@@ -447,8 +448,25 @@ def build_settings_cancel_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def build_miniapp_inline_keyboard(miniapp_url: str | None) -> InlineKeyboardMarkup | None:
+    """Build an inline Mini App button with signed ``initData`` support, or ``None`` if invalid."""
+    safe_url = normalize_https_miniapp_url(miniapp_url)
+    if safe_url is None:
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=MINIAPP_OPEN_BTN,
+                    web_app=WebAppInfo(url=safe_url),
+                ),
+            ],
+        ],
+    )
+
+
 def build_main_menu_keyboard(miniapp_url: str | None = None) -> ReplyKeyboardMarkup:
-    """Build the persistent main menu, adding Mini App ``WebAppInfo`` only for HTTPS URLs."""
+    """Build the persistent main menu with a plain-text Statistics button when HTTPS URL is set."""
     first_row = [
         KeyboardButton(text=MENU_BTN_TRAINING),
         KeyboardButton(text=MENU_BTN_VOCABULARY),
@@ -459,12 +477,7 @@ def build_main_menu_keyboard(miniapp_url: str | None = None) -> ReplyKeyboardMar
 
     safe_miniapp_url = normalize_https_miniapp_url(miniapp_url)
     if safe_miniapp_url is not None:
-        second_row.append(
-            KeyboardButton(
-                text=MENU_BTN_MINIAPP,
-                web_app=WebAppInfo(url=safe_miniapp_url),
-            ),
-        )
+        second_row.append(KeyboardButton(text=MENU_BTN_MINIAPP))
 
     return ReplyKeyboardMarkup(
         keyboard=[first_row, second_row],
@@ -481,6 +494,7 @@ __all__ = [
     "MENU_BTN_SETTINGS",
     "MENU_BTN_TRAINING",
     "MENU_BTN_VOCABULARY",
+    "MINIAPP_OPEN_BTN",
     "POPULAR_TIMEZONES",
     "SETTINGS_BTN_BACK",
     "SETTINGS_BTN_CANCEL",
@@ -529,6 +543,7 @@ __all__ = [
     "build_exercise_keyboard",
     "build_level_keyboard",
     "build_main_menu_keyboard",
+    "build_miniapp_inline_keyboard",
     "build_settings_cancel_keyboard",
     "build_settings_exercises_keyboard",
     "build_settings_level_keyboard",

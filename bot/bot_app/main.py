@@ -6,15 +6,18 @@ import asyncio
 import logging
 
 from aiogram import Bot, Dispatcher, Router
+from aiogram.exceptions import TelegramAPIError
+from aiogram.types import MenuButtonDefault, MenuButtonWebApp, WebAppInfo
 
 from bot_app.api_client import BackendAPIClient
-from bot_app.config import BotSettings, get_settings
+from bot_app.config import BotSettings, get_settings, normalize_https_miniapp_url
 from bot_app.handlers import (
     settings_router,
     start_router,
     training_router,
     vocabulary_router,
 )
+from bot_app.keyboards import MENU_BTN_MINIAPP
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +56,33 @@ def create_dispatcher(api_client: BackendAPIClient, settings: BotSettings) -> Di
     return dispatcher
 
 
+async def configure_menu_button(bot: Bot, miniapp_url: str | None) -> None:
+    """Configure Telegram's native chat menu button for the Mini App, or reset to default."""
+    safe_url = normalize_https_miniapp_url(miniapp_url)
+    menu_button: MenuButtonWebApp | MenuButtonDefault
+    if safe_url is not None:
+        menu_button = MenuButtonWebApp(
+            text=MENU_BTN_MINIAPP,
+            web_app=WebAppInfo(url=safe_url),
+        )
+    else:
+        menu_button = MenuButtonDefault()
+
+    try:
+        await bot.set_chat_menu_button(menu_button=menu_button)
+    except TelegramAPIError as exc:
+        error_message = exc.message
+        bot_token = getattr(bot, "token", None)
+        if isinstance(bot_token, str) and bot_token:
+            error_message = error_message.replace(bot_token, "[REDACTED]")
+        logger.warning(
+            "Failed to configure Telegram chat menu button (miniapp_enabled=%s, error=%s): %s",
+            safe_url is not None,
+            type(exc).__name__,
+            error_message,
+        )
+
+
 async def run_polling(settings: BotSettings | None = None) -> None:
     """Run the Telegram bot in long-polling mode with clean HTTP client shutdown."""
     resolved_settings = settings if settings is not None else get_settings()
@@ -77,6 +107,7 @@ async def run_polling(settings: BotSettings | None = None) -> None:
         resolved_settings.https_miniapp_url is not None,
     )
     try:
+        await configure_menu_button(bot, resolved_settings.miniapp_url)
         await dispatcher.start_polling(bot)
     finally:
         await api_client.aclose()

@@ -4,36 +4,66 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 import respx
-from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup
+from aiogram.exceptions import TelegramAPIError
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import StorageKey
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.methods import SetChatMenuButton
+from aiogram.types import (
+    Chat,
+    InlineKeyboardMarkup,
+    MenuButtonDefault,
+    MenuButtonWebApp,
+    Message,
+    ReplyKeyboardMarkup,
+    Update,
+    User,
+    WebAppInfo,
+)
 
+import bot_app.keyboards as keyboards_module
+import bot_app.main as main_module
 from bot_app.api_client import BackendAPIClient
 from bot_app.config import BotSettings, normalize_https_miniapp_url
+from bot_app.handlers.settings import SettingsStates
 from bot_app.handlers.start import (
     LEVEL_PROMPT_TEXT_UA,
+    MINIAPP_OPEN_TEXT_UA,
+    MINIAPP_UNAVAILABLE_TEXT_UA,
     UNKNOWN_LEVEL_MESSAGE_UA,
     handle_level_selection,
+    handle_miniapp_menu,
     handle_start,
 )
+from bot_app.handlers.training import TrainingStates
+from bot_app.handlers.vocabulary import VocabStates
 from bot_app.keyboards import (
     MENU_BTN_MINIAPP,
     MENU_BTN_SETTINGS,
     MENU_BTN_TRAINING,
     MENU_BTN_VOCABULARY,
+    MINIAPP_OPEN_BTN,
     build_level_keyboard,
     build_main_menu_keyboard,
+    build_miniapp_inline_keyboard,
 )
-from bot_app.main import create_dispatcher
+from bot_app.main import configure_menu_button, create_dispatcher, run_polling
 
 BASE_URL = "http://backend.test:8000"
 SECRET_API_KEY = "test-internal-api-key-42"
+BOT_TOKEN_SECRET = "123456:TEST-BOT-TOKEN-SECRET"
+BOT_ID = 777023
 USER_ID = 987654321
+CHAT_ID = 987654321
 
 
 def _profile_payload(level: str = "A1") -> dict[str, object]:
@@ -112,20 +142,31 @@ def test_normalize_https_miniapp_url(raw_url: str | None, expected: str | None) 
     assert normalize_https_miniapp_url(raw_url) == expected
 
 
-def test_main_menu_includes_webapp_only_for_https_url() -> None:
-    with_https = build_main_menu_keyboard("https://deutsch.example.com/app")
-    https_buttons = _flatten_reply_buttons(with_https)
-    assert [btn.text for btn in https_buttons] == [
-        MENU_BTN_TRAINING,
-        MENU_BTN_VOCABULARY,
-        MENU_BTN_SETTINGS,
-        MENU_BTN_MINIAPP,
-    ]
-    miniapp_btn = https_buttons[-1]
-    assert miniapp_btn.web_app is not None
-    assert miniapp_btn.web_app.url == "https://deutsch.example.com/app"
+def test_main_menu_never_sets_webapp_and_includes_plain_stats_only_for_https_url() -> None:
+    for valid_url in (
+        "https://deutsch.example.com/app",
+        "  HTTPS://deutsch.example.com/app?v=1  ",
+    ):
+        with_https = build_main_menu_keyboard(valid_url)
+        https_buttons = _flatten_reply_buttons(with_https)
+        assert [btn.text for btn in https_buttons] == [
+            MENU_BTN_TRAINING,
+            MENU_BTN_VOCABULARY,
+            MENU_BTN_SETTINGS,
+            MENU_BTN_MINIAPP,
+        ]
+        assert all(btn.web_app is None for btn in https_buttons)
 
-    for unsafe_url in (None, "", "   ", "http://127.0.0.1:8080", "http://localhost:5173"):
+    for unsafe_url in (
+        None,
+        "",
+        "   ",
+        "http://127.0.0.1:8080",
+        "http://localhost:8080",
+        "ftp://example.com",
+        "https://",
+        "https://example.com/my app",
+    ):
         without_https = build_main_menu_keyboard(unsafe_url)
         buttons = _flatten_reply_buttons(without_https)
         assert [btn.text for btn in buttons] == [
@@ -134,6 +175,29 @@ def test_main_menu_includes_webapp_only_for_https_url() -> None:
             MENU_BTN_SETTINGS,
         ]
         assert all(btn.web_app is None for btn in buttons)
+
+
+def test_build_miniapp_inline_keyboard_returns_inline_webapp_or_none() -> None:
+    assert "build_miniapp_inline_keyboard" in keyboards_module.__all__
+
+    valid = build_miniapp_inline_keyboard("  HTTPS://deutsch.example.com/app?v=1  ")
+    assert isinstance(valid, InlineKeyboardMarkup)
+    assert len(valid.inline_keyboard) == 1
+    assert len(valid.inline_keyboard[0]) == 1
+    button = valid.inline_keyboard[0][0]
+    assert button.text == MINIAPP_OPEN_BTN == "📊 Відкрити статистику"
+    assert button.web_app == WebAppInfo(url="https://deutsch.example.com/app?v=1")
+
+    for invalid_url in (
+        None,
+        "",
+        "   ",
+        "http://localhost:8080",
+        "ftp://example.com/app",
+        "https://",
+        "https://example.com/with space",
+    ):
+        assert build_miniapp_inline_keyboard(invalid_url) is None
 
 
 def test_level_keyboard_contains_a1_a2_b1() -> None:
@@ -173,9 +237,14 @@ async def test_start_handler_initializes_user_and_sends_menu_with_https_miniapp(
     assert "A1" in welcome_call.args[0]
     main_menu = welcome_call.kwargs["reply_markup"]
     assert isinstance(main_menu, ReplyKeyboardMarkup)
-    miniapp_buttons = [b for b in _flatten_reply_buttons(main_menu) if b.web_app is not None]
-    assert len(miniapp_buttons) == 1
-    assert miniapp_buttons[0].web_app.url == "https://deutsch.example.com"
+    buttons = _flatten_reply_buttons(main_menu)
+    assert [b.text for b in buttons] == [
+        MENU_BTN_TRAINING,
+        MENU_BTN_VOCABULARY,
+        MENU_BTN_SETTINGS,
+        MENU_BTN_MINIAPP,
+    ]
+    assert all(b.web_app is None for b in buttons)
 
     level_call = message.answer.await_args_list[1]
     assert level_call.args[0] == LEVEL_PROMPT_TEXT_UA
@@ -207,7 +276,9 @@ async def test_start_handler_omits_webapp_when_miniapp_url_is_empty_or_http() ->
 
         main_menu = message.answer.await_args_list[0].kwargs["reply_markup"]
         assert isinstance(main_menu, ReplyKeyboardMarkup)
-        assert all(b.web_app is None for b in _flatten_reply_buttons(main_menu))
+        buttons = _flatten_reply_buttons(main_menu)
+        assert MENU_BTN_MINIAPP not in [b.text for b in buttons]
+        assert all(b.web_app is None for b in buttons)
 
 
 @pytest.mark.parametrize("selected_level", ["A1", "A2", "B1"])
@@ -354,6 +425,348 @@ async def test_dispatcher_wires_dependencies_and_start_router() -> None:
         assert dispatcher["api_client"] is client
         assert dispatcher["settings"] is settings
         assert any(r.name == "start" for r in dispatcher.sub_routers)
+
+
+async def test_handle_miniapp_menu_sends_inline_webapp_for_valid_https_url() -> None:
+    settings = BotSettings(
+        _env_file=None,
+        bot_token=BOT_TOKEN_SECRET,
+        internal_api_key=SECRET_API_KEY,
+        backend_api_url=BASE_URL,
+        miniapp_url="https://deutsch.example.com/app",
+    )
+    message = _make_message()
+
+    await handle_miniapp_menu(message=message, settings=settings)
+
+    message.answer.assert_awaited_once()
+    assert message.answer.await_args.args[0] == MINIAPP_OPEN_TEXT_UA
+    markup = message.answer.await_args.kwargs["reply_markup"]
+    assert isinstance(markup, InlineKeyboardMarkup)
+    assert len(markup.inline_keyboard) == 1
+    assert len(markup.inline_keyboard[0]) == 1
+    btn = markup.inline_keyboard[0][0]
+    assert btn.text == MINIAPP_OPEN_BTN
+    assert btn.web_app == WebAppInfo(url="https://deutsch.example.com/app")
+
+
+async def test_handle_miniapp_menu_ignores_message_without_from_user() -> None:
+    storage = MemoryStorage()
+    key = StorageKey(bot_id=BOT_ID, chat_id=CHAT_ID, user_id=USER_ID)
+    state = FSMContext(storage=storage, key=key)
+    await state.set_state(VocabStates.waiting_import)
+
+    settings = BotSettings(
+        _env_file=None,
+        bot_token=BOT_TOKEN_SECRET,
+        internal_api_key=SECRET_API_KEY,
+        backend_api_url=BASE_URL,
+        miniapp_url="https://deutsch.example.com/app",
+    )
+    message = SimpleNamespace(from_user=None, answer=AsyncMock())
+
+    await handle_miniapp_menu(message=message, settings=settings, state=state)
+
+    message.answer.assert_not_awaited()
+    assert await state.get_state() == VocabStates.waiting_import.state
+
+
+@pytest.mark.parametrize(
+    "invalid_url",
+    [None, "", "   ", "http://localhost:8080", "ftp://example.com", "https://"],
+)
+async def test_handle_miniapp_menu_sends_fallback_when_url_missing_or_invalid(
+    invalid_url: str | None,
+) -> None:
+    settings = BotSettings(
+        _env_file=None,
+        bot_token=BOT_TOKEN_SECRET,
+        internal_api_key=SECRET_API_KEY,
+        backend_api_url=BASE_URL,
+        miniapp_url=invalid_url,
+    )
+    message = _make_message()
+
+    await handle_miniapp_menu(message=message, settings=settings)
+
+    message.answer.assert_awaited_once_with(MINIAPP_UNAVAILABLE_TEXT_UA)
+    assert "reply_markup" not in message.answer.await_args.kwargs
+
+
+@respx.mock
+async def test_dispatcher_miniapp_button_preserves_waiting_answer_and_does_not_submit_answer() -> (
+    None
+):
+    answer_route = respx.post(f"{BASE_URL}/api/sessions/42/answer").mock(
+        return_value=httpx.Response(500, json={"detail": "Must not be called"}),
+    )
+    settings = BotSettings(
+        _env_file=None,
+        bot_token=BOT_TOKEN_SECRET,
+        internal_api_key=SECRET_API_KEY,
+        backend_api_url=BASE_URL,
+        miniapp_url="https://deutsch.example.com/app",
+    )
+    session_data = {
+        "session_id": 42,
+        "current_exercise_number": 2,
+        "total_exercises": 5,
+        "attempt_id": 99,
+    }
+
+    async with BackendAPIClient(base_url=BASE_URL, internal_api_key=SECRET_API_KEY) as client:
+        dispatcher = create_dispatcher(api_client=client, settings=settings)
+        key = StorageKey(bot_id=BOT_ID, chat_id=CHAT_ID, user_id=USER_ID)
+        await dispatcher.storage.set_state(key, TrainingStates.waiting_answer)
+        await dispatcher.storage.set_data(key, session_data)
+
+        bot = MagicMock()
+        bot.id = BOT_ID
+        sent_payloads: list[object] = []
+
+        async def _capture(method: object, request_timeout: int | None = None) -> None:
+            sent_payloads.append(method)
+
+        bot.side_effect = _capture
+
+        stats_msg = Message(
+            message_id=101,
+            date=datetime(2026, 11, 24, 12, 0, tzinfo=UTC),
+            chat=Chat(id=CHAT_ID, type="private"),
+            from_user=User(id=USER_ID, is_bot=False, first_name="Tester"),
+            text=MENU_BTN_MINIAPP,
+        )
+        await dispatcher.feed_update(bot, Update(update_id=101, message=stats_msg))
+
+        assert not answer_route.called
+        assert await dispatcher.storage.get_state(key) == TrainingStates.waiting_answer.state
+        assert await dispatcher.storage.get_data(key) == session_data
+        assert len(sent_payloads) == 1
+        sent = sent_payloads[0]
+        assert getattr(sent, "text", None) == MINIAPP_OPEN_TEXT_UA
+        markup = getattr(sent, "reply_markup", None)
+        assert isinstance(markup, InlineKeyboardMarkup)
+        assert markup.inline_keyboard[0][0].text == MINIAPP_OPEN_BTN
+        assert markup.inline_keyboard[0][0].web_app == WebAppInfo(
+            url="https://deutsch.example.com/app",
+        )
+
+
+@respx.mock
+async def test_dispatcher_miniapp_fallback_also_preserves_waiting_answer() -> None:
+    answer_route = respx.post(f"{BASE_URL}/api/sessions/42/answer").mock(
+        return_value=httpx.Response(500, json={"detail": "Must not be called"}),
+    )
+    settings = BotSettings(
+        _env_file=None,
+        bot_token=BOT_TOKEN_SECRET,
+        internal_api_key=SECRET_API_KEY,
+        backend_api_url=BASE_URL,
+        miniapp_url="http://localhost:8080",
+    )
+
+    async with BackendAPIClient(base_url=BASE_URL, internal_api_key=SECRET_API_KEY) as client:
+        dispatcher = create_dispatcher(api_client=client, settings=settings)
+        key = StorageKey(bot_id=BOT_ID, chat_id=CHAT_ID, user_id=USER_ID)
+        await dispatcher.storage.set_state(key, TrainingStates.waiting_answer)
+        await dispatcher.storage.set_data(key, {"session_id": 42})
+
+        bot = MagicMock()
+        bot.id = BOT_ID
+        sent_payloads: list[object] = []
+
+        async def _capture(method: object, request_timeout: int | None = None) -> None:
+            sent_payloads.append(method)
+
+        bot.side_effect = _capture
+
+        stats_msg = Message(
+            message_id=102,
+            date=datetime(2026, 11, 24, 12, 1, tzinfo=UTC),
+            chat=Chat(id=CHAT_ID, type="private"),
+            from_user=User(id=USER_ID, is_bot=False, first_name="Tester"),
+            text=MENU_BTN_MINIAPP,
+        )
+        await dispatcher.feed_update(bot, Update(update_id=102, message=stats_msg))
+
+        assert not answer_route.called
+        assert await dispatcher.storage.get_state(key) == TrainingStates.waiting_answer.state
+        assert await dispatcher.storage.get_data(key) == {"session_id": 42}
+        assert len(sent_payloads) == 1
+        assert getattr(sent_payloads[0], "text", None) == MINIAPP_UNAVAILABLE_TEXT_UA
+        assert getattr(sent_payloads[0], "reply_markup", None) is None
+
+
+@pytest.mark.parametrize(
+    "initial_state",
+    [
+        VocabStates.waiting_import,
+        VocabStates.waiting_sheets_url,
+        SettingsStates.waiting_exercises_per_set,
+        SettingsStates.waiting_reminder_hour,
+        SettingsStates.waiting_timezone,
+        TrainingStates.choosing_topic,
+    ],
+)
+async def test_dispatcher_miniapp_button_clears_other_fsm_states_without_api_calls(
+    initial_state: object,
+) -> None:
+    api_client = AsyncMock(spec=BackendAPIClient)
+    settings = BotSettings(
+        _env_file=None,
+        bot_token=BOT_TOKEN_SECRET,
+        internal_api_key=SECRET_API_KEY,
+        backend_api_url=BASE_URL,
+        miniapp_url="https://deutsch.example.com/app",
+    )
+    dispatcher = create_dispatcher(api_client=api_client, settings=settings)
+    key = StorageKey(bot_id=BOT_ID, chat_id=CHAT_ID, user_id=USER_ID)
+    await dispatcher.storage.set_state(key, initial_state)
+    await dispatcher.storage.set_data(key, {"draft": "pending"})
+
+    bot = MagicMock()
+    bot.id = BOT_ID
+    sent_payloads: list[object] = []
+
+    async def _capture(method: object, request_timeout: int | None = None) -> None:
+        sent_payloads.append(method)
+
+    bot.side_effect = _capture
+
+    stats_msg = Message(
+        message_id=103,
+        date=datetime(2026, 11, 24, 12, 2, tzinfo=UTC),
+        chat=Chat(id=CHAT_ID, type="private"),
+        from_user=User(id=USER_ID, is_bot=False, first_name="Tester"),
+        text=MENU_BTN_MINIAPP,
+    )
+    await dispatcher.feed_update(bot, Update(update_id=103, message=stats_msg))
+
+    assert await dispatcher.storage.get_state(key) is None
+    assert await dispatcher.storage.get_data(key) == {}
+    api_client.import_words_text.assert_not_awaited()
+    api_client.update_settings.assert_not_awaited()
+    api_client.start_session.assert_not_awaited()
+    api_client.submit_answer.assert_not_awaited()
+    assert len(sent_payloads) == 1
+    sent = sent_payloads[0]
+    assert getattr(sent, "text", None) == MINIAPP_OPEN_TEXT_UA
+    markup = getattr(sent, "reply_markup", None)
+    assert isinstance(markup, InlineKeyboardMarkup)
+    assert markup.inline_keyboard[0][0].text == MINIAPP_OPEN_BTN
+    assert markup.inline_keyboard[0][0].web_app == WebAppInfo(
+        url="https://deutsch.example.com/app",
+    )
+
+
+async def test_configure_menu_button_sets_webapp_for_valid_https_url() -> None:
+    bot = AsyncMock()
+
+    await configure_menu_button(bot, "  HTTPS://deutsch.example.com/app  ")
+
+    bot.set_chat_menu_button.assert_awaited_once_with(
+        menu_button=MenuButtonWebApp(
+            text=MENU_BTN_MINIAPP,
+            web_app=WebAppInfo(url="https://deutsch.example.com/app"),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid_url",
+    [None, "", "   ", "http://localhost:8080", "ftp://example.com", "https://"],
+)
+async def test_configure_menu_button_resets_to_default_for_missing_or_invalid_url(
+    invalid_url: str | None,
+) -> None:
+    bot = AsyncMock()
+
+    await configure_menu_button(bot, invalid_url)
+
+    bot.set_chat_menu_button.assert_awaited_once_with(
+        menu_button=MenuButtonDefault(),
+    )
+
+
+async def test_configure_menu_button_handles_telegram_api_error_without_leaking_secrets(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    bot = AsyncMock()
+    bot.token = BOT_TOKEN_SECRET
+    bot.set_chat_menu_button.side_effect = TelegramAPIError(
+        method=SetChatMenuButton(),
+        message=f"Bad Request: failed for token {BOT_TOKEN_SECRET}",
+    )
+
+    with caplog.at_level(logging.WARNING, logger=main_module.__name__):
+        await configure_menu_button(bot, "https://deutsch.example.com/app")
+
+    bot.set_chat_menu_button.assert_awaited_once()
+    warning_messages = [
+        rec.getMessage() for rec in caplog.records if rec.levelno == logging.WARNING
+    ]
+    assert len(warning_messages) == 1
+    assert BOT_TOKEN_SECRET not in warning_messages[0]
+    assert SECRET_API_KEY not in warning_messages[0]
+
+
+async def test_run_polling_configures_menu_button_before_polling_and_survives_api_error(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    events: list[str] = []
+
+    fake_bot = MagicMock()
+    fake_bot.token = BOT_TOKEN_SECRET
+    fake_bot.session = MagicMock()
+    fake_bot.session.close = AsyncMock()
+
+    async def _set_menu_button(*, menu_button: object) -> None:
+        events.append("set_chat_menu_button")
+        assert menu_button == MenuButtonWebApp(
+            text=MENU_BTN_MINIAPP,
+            web_app=WebAppInfo(url="https://deutsch.example.com/app"),
+        )
+        raise TelegramAPIError(
+            method=SetChatMenuButton(),
+            message="Bad Request: temporary Telegram error",
+        )
+
+    fake_bot.set_chat_menu_button = AsyncMock(side_effect=_set_menu_button)
+
+    fake_dispatcher = MagicMock()
+
+    async def _start_polling(bot: object) -> None:
+        assert bot is fake_bot
+        events.append("start_polling")
+
+    fake_dispatcher.start_polling = AsyncMock(side_effect=_start_polling)
+
+    monkeypatch.setattr(main_module, "create_bot", lambda _settings: fake_bot)
+    monkeypatch.setattr(
+        main_module,
+        "create_dispatcher",
+        lambda *, api_client, settings: fake_dispatcher,
+    )
+
+    settings = BotSettings(
+        _env_file=None,
+        bot_token=BOT_TOKEN_SECRET,
+        internal_api_key=SECRET_API_KEY,
+        backend_api_url=BASE_URL,
+        miniapp_url="https://deutsch.example.com/app",
+    )
+
+    with caplog.at_level(logging.WARNING, logger=main_module.__name__):
+        await run_polling(settings=settings)
+
+    assert events == ["set_chat_menu_button", "start_polling"]
+    fake_dispatcher.start_polling.assert_awaited_once_with(fake_bot)
+    fake_bot.session.close.assert_awaited_once()
+    combined_logs = "\n".join(rec.getMessage() for rec in caplog.records)
+    assert "temporary Telegram error" in combined_logs
+    assert BOT_TOKEN_SECRET not in combined_logs
+    assert SECRET_API_KEY not in combined_logs
 
 
 def test_bot_has_zero_python_imports_from_backend() -> None:
